@@ -1,0 +1,26 @@
+INSTALLATION
+
+	1. 
+	Unzip lib/glm-0.9.9.2.zip
+	This should create the directory "lib/glm-0.9.9.2/" within the solution directory.
+
+	2.
+	Install Qt5.15 LTS with msvc2019_64 compiler support
+
+	3.
+	Define QTDIR as a Windows environment variable, and make it target the Qt binaries:
+		Example: QTDIR = C:\DEV\lib\Qt\Qt5.15\5.15.0\msvc2019_64
+		
+	3. 
+	Run Visual Studio 2019.
+	Install the QtVSTools extension from within VS.
+	Restart VS.
+	Go to the Extensions menu and hover on Qt Vs Tools, then in the drop down menu select Qt Options.
+	Add an entry: name it as you wish (eg., msvc2019_64_qt5.15) and select the Qt toolchain (eg., C:\DEV\lib\Qt\Qt5.15\5.15.0\msvc2019_64) to use.
+
+	4. 
+	Restart Visual Studio and load the AppPlanetSubdiv solution.
+	Right-click on the solution in the Solution Explorer panel and select "Change Solution Qt's Version", then select the entry you created in step 3.
+
+	Everything should be good from now.
+

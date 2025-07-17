@@ -1,0 +1,221 @@
+#version 450
+
+// --- structures de données ---
+#define TYPE_NONE							0	
+#define TYPE_SEA							1		
+#define TYPE_CONTINENT						2
+#define TYPE_RIVER							3
+#define TYPE_COAST							4
+#define TYPE_RIDGE							5
+#define TYPE_DRAINAGE						6
+
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Vertex
+{
+	/// first list of indexes of incident faces (or -1 if none)
+	int faces_0[4];
+	/// second list of indexes of incident faces (or -1 if none)
+	int faces_1[4];
+	/// PRNG seed
+	uint seed;
+	/// boolean = ghost or not ghost vertex
+	uint status;
+	//
+	uint type;
+	///
+	uint branch_count; 	
+	/// indexes of the vertices acting as river primitives
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;		
+	//int pad[4];
+};
+struct Face
+{
+	/// indexes of the three edges.
+	int e0, e1, e2;
+	/// normal to the triangle
+	float normal_x, normal_y, normal_z;
+	/// LSB to MSB : byte 0 = boolean (split 1 or not 0), byte 2 = lod
+	uint status;
+	//
+	uint type;
+};
+struct VertexAttrib
+{
+	/// xyz = world position (km), w = altitude (km)
+	dvec4 position;
+	/// x = nearest river altitude, y = distance to nearest river, z = tectonic altitude, w = water altitude
+	dvec4 data;
+	/// xyz = normalized flow direction, w = unused
+	vec4 flow;
+	/// x = nearest ravin altitude, y = distance to nearest ravin
+	vec4 misc1;
+	/// unused
+	vec4 misc2;
+	//
+	vec4 padding;
+};
+struct WaterVertexAttrib
+{
+	/// xyz = 3D position, w = average water altitude (before wave displacement)
+	dvec4 position;
+	/// xyz = normal to water surface, w = unused
+	vec4 normal;
+	/// xyz = water flow direction normalized, w = unused
+	vec4 flow;
+	
+	/// indexes of the vertices acting as river primitives
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;		
+	ivec4 padding2;
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) readonly buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 1, std430) readonly buffer faces_buffer 
+{
+  Face faces[];
+};
+layout(binding = 2, std430) readonly buffer vertices_buffer
+{
+	Vertex vertices[];
+};
+layout(binding = 3, std430) coherent buffer water_vattribs_buffer 
+{
+  WaterVertexAttrib water_vattribs[];
+};
+
+// --- uniforms ---
+uniform uint lastVertexIndex;
+uniform double renderScale;
+uniform double planetRadiusKm;
+
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint index = gl_GlobalInvocationID.x;
+	if (index > lastVertexIndex)
+		return;
+
+	const dvec4 NOVERTEX = dvec4(0.0LF); 
+	const WaterVertexAttrib wattrib = water_vattribs[index];	
+	if (wattrib.position == NOVERTEX)
+		return;
+	
+	const Vertex V = vertices[index];
+	Face F;
+	Edge e0;
+	Edge e1;
+	Edge e2;
+	uint v0, v1, v2;	
+	
+	// --- compute water vertex normal ---	
+	dvec3 normal = dvec3(0.0LF);
+	for (int i=0; i < 4; ++i)
+		if (V.faces_0[i] >= 0)
+		{
+			F = faces[V.faces_0[i]];
+			e0 = edges[F.e0];
+			e1 = edges[F.e1];
+			e2 = edges[F.e2];
+			bool flip0 = false;
+			bool flip1 = false;
+			bool flip2 = false;//determine winding of edges (as they can appear in any order)
+			if (e0.v0 == e1.v0 || e0.v0 == e1.v1)
+				flip0 = true;
+			if (e1.v0 == e2.v0 || e1.v0 == e2.v1)
+				flip1 = true;
+			if (e2.v0 == e0.v0 || e2.v0 == e0.v1)
+				flip2 = true;
+
+			v0 = uint(flip0 ? e0.v1 : e0.v0);
+			v1 = uint(flip1 ? e1.v1 : e1.v0);
+			v2 = uint(flip2 ? e2.v1 : e2.v0);
+			
+			// skip if no water there
+			const WaterVertexAttrib wa0 = water_vattribs[v0];
+			if (wa0.position == NOVERTEX)
+				continue;
+			const WaterVertexAttrib wa1 = water_vattribs[v1];
+			if (wa1.position == NOVERTEX)
+				continue;
+			const WaterVertexAttrib wa2 = water_vattribs[v2];
+			if (wa2.position == NOVERTEX)
+				continue;
+					
+			const dvec3 p0 = normalize(wa0.position.xyz) * (planetRadiusKm + wa0.position.w);
+			const dvec3 p1 = normalize(wa1.position.xyz) * (planetRadiusKm + wa1.position.w);
+			const dvec3 p2 = normalize(wa2.position.xyz) * (planetRadiusKm + wa2.position.w);
+			normal += cross((p1 - p0)/renderScale, (p2 - p0)/renderScale);			
+		}
+	for (int i=0; i < 4; ++i)
+		if (V.faces_1[i] >= 0)
+		{
+			F = faces[V.faces_1[i]];
+			e0 = edges[F.e0];
+			e1 = edges[F.e1];
+			e2 = edges[F.e2];
+			bool flip0 = false;
+			bool flip1 = false;
+			bool flip2 = false;//determine winding of edges (as they can appear in any order)
+			if (e0.v0 == e1.v0 || e0.v0 == e1.v1)
+				flip0 = true;
+			if (e1.v0 == e2.v0 || e1.v0 == e2.v1)
+				flip1 = true;
+			if (e2.v0 == e0.v0 || e2.v0 == e0.v1)
+				flip2 = true;
+
+			v0 = uint(flip0 ? e0.v1 : e0.v0);
+			v1 = uint(flip1 ? e1.v1 : e1.v0);
+			v2 = uint(flip2 ? e2.v1 : e2.v0);
+			
+			// skip if no water there
+			const WaterVertexAttrib wa0 = water_vattribs[v0];
+			if (wa0.position == NOVERTEX)
+				continue;
+			const WaterVertexAttrib wa1 = water_vattribs[v1];
+			if (wa1.position == NOVERTEX)
+				continue;
+			const WaterVertexAttrib wa2 = water_vattribs[v2];
+			if (wa2.position == NOVERTEX)
+				continue;
+						
+			const dvec3 p0 = normalize(wa0.position.xyz) * (planetRadiusKm + wa0.position.w);
+			const dvec3 p1 = normalize(wa1.position.xyz) * (planetRadiusKm + wa1.position.w);
+			const dvec3 p2 = normalize(wa2.position.xyz) * (planetRadiusKm + wa2.position.w);
+			normal += cross((p1 - p0)/renderScale, (p2 - p0)/renderScale);				
+		}
+
+	if (normal != dvec3(0.0LF))
+		normal = normalize(normal);
+	else normal = normalize(wattrib.position.xyz/renderScale);//fallback in case something degenerates (should not happen but hey !)
+	
+	water_vattribs[index].normal.xyz = vec3(normal);//store normal 
+}

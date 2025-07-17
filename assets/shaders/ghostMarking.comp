@@ -1,0 +1,140 @@
+#version 450
+
+// --- structures de données ---
+#define TYPE_NONE							0	
+#define TYPE_SEA							1		
+#define TYPE_CONTINENT						2
+#define TYPE_RIVER							3
+#define TYPE_COAST							4
+#define TYPE_RIDGE							5
+#define TYPE_DRAINAGE						6
+
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Vertex
+{
+	/// first list of indexes of incident faces (or -1 if none)
+	int faces_0[4];
+	/// second list of indexes of incident faces (or -1 if none)
+	int faces_1[4];
+	/// PRNG seed
+	uint seed;
+	/// boolean = ghost or not ghost vertex
+	uint status;
+	//
+	uint type;
+	///
+	uint branch_count; 
+	/// indexes of the vertices acting as river primitives
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;
+	//int pad[4];
+};
+struct Face
+{
+	/// indexes of the three edges.
+	int e0, e1, e2;
+	/// normal to the triangle
+	float normal_x, normal_y, normal_z;
+	/// LSB to MSB : byte 0 = boolean (split 1 or not 0), byte 2 = lod
+	uint status;
+	//
+	uint type;
+};
+struct VertexAttrib
+{
+	/// xyz = world position (km), w = altitude (km)
+	dvec4 position;
+	/// x = nearest river altitude, y = distance to nearest river, z = tectonic altitude, w = water altitude
+	dvec4 data;
+	/// xyz = normalized flow direction, w = unused
+	vec4 flow;
+	/// x = nearest ravin altitude, y = distance to nearest ravin
+	vec4 misc1;
+	// unused
+	vec4 misc2;
+	//
+	vec4 padding;
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) coherent buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 1, std430) readonly buffer vertices_buffer 
+{
+  Vertex vertices[];
+};
+layout(binding = 2, std430) readonly buffer faces_buffer 
+{
+  Face faces[];
+};
+layout(binding = 3, std430) readonly buffer vattribs_buffer 
+{
+  VertexAttrib vattribs[];
+};
+
+// --- uniforms ---
+uniform uint baseFaceIndex;
+uniform uint lastFaceIndex;
+
+
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint i = gl_GlobalInvocationID.x  +  baseFaceIndex;
+	if (i > lastFaceIndex)
+		return;
+
+	const int e0 = faces[i].e0;
+	const int e1 = faces[i].e1;
+	const int e2 = faces[i].e2;
+	
+	int count = 0;
+	if ((edges[e0].status & 255u) == 2u)
+		count++;
+	if ((edges[e1].status & 255u) == 2u)
+		count++;
+	if ((edges[e2].status & 255u) == 2u)
+		count++;
+		
+	if (count == 0 || count == 3)
+		return;
+	
+	if ((edges[e0].status & 255u) == 0)
+	{
+		precise uint ss = edges[e0].status >> 16;
+		edges[e0].status = (ss << 16) | (2u << 8);//mark for a ghost split
+	}
+	if ((edges[e1].status & 255u) == 0)
+	{
+		precise uint ss = edges[e1].status >> 16;
+		edges[e1].status = (ss << 16) | (2u << 8);//mark for a ghost split
+	}
+	if ((edges[e2].status & 255u) == 0)
+	{
+		precise uint ss = edges[e2].status >> 16;
+		edges[e2].status = (ss << 16) | (2u << 8);//mark for a ghost split
+	}
+}

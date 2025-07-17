@@ -1,0 +1,479 @@
+#version 450
+
+// --- structures de données ---
+#define TYPE_NONE							0	
+#define TYPE_SEA							1		
+#define TYPE_CONTINENT						2
+#define TYPE_RIVER							3
+#define TYPE_COAST							4
+#define TYPE_RIDGE							5
+#define TYPE_DRAINAGE						6
+
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Vertex
+{
+	/// first list of indexes of incident faces (or -1 if none)
+	int faces_0[4];
+	/// second list of indexes of incident faces (or -1 if none)
+	int faces_1[4];
+	/// PRNG seed
+	uint seed;
+	/// boolean = ghost or not ghost vertex
+	uint status;
+	//
+	uint type;
+	///
+	uint branch_count;
+
+	/// some references (prim0 is used as a containing triangle index, for water animation ; prim1 is unused ; prim2 is a vertex reference used for lakes]
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;
+	//int pad[4];
+};
+struct Face
+{
+	/// indexes of the three edges.
+	int e0, e1, e2;
+	/// normal to the triangle
+	float normal_x, normal_y, normal_z;
+	/// LSB to MSB : byte 0 = boolean (split 1 or not 0), byte 2 = lod
+	uint status;
+	//
+	uint type;
+};
+struct VertexAttrib
+{
+	/// xyz = world position (km), w = altitude (km)
+	dvec4 position;
+	/// x = nearest river altitude, y = distance to nearest river, z = tectonic altitude, w = water altitude
+	dvec4 data;
+	/// xyz = normalized flow direction, w = unused
+	vec4 flow;
+	/// x = nearest ravin altitude, y = distance to nearest ravin
+	vec4 misc1;
+	// unused
+	vec4 misc2;
+	//
+	vec4 padding;
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) coherent buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 1, std430) coherent buffer vertices_buffer 
+{
+  Vertex vertices[];
+};
+layout(binding = 2, std430) coherent buffer faces_buffer 
+{
+  Face faces[];
+};
+layout(binding = 3, std430) coherent buffer vattribs_buffer 
+{
+  VertexAttrib vattribs[];
+};
+
+// --- atomic counters ---
+layout (binding = 5, offset = 0) uniform atomic_uint edgeCounter;
+layout (binding = 6, offset = 0) uniform atomic_uint vertexCounter;
+layout (binding = 7, offset = 0) uniform atomic_uint faceCounter;
+
+// --- uniforms ---
+uniform uint baseFaceIndex;
+uniform uint lastFaceIndex;
+uniform double planetRadiusKm;
+uniform double seaLevelKm;
+uniform double renderScale;
+
+uniform uint optionRiverPrimitives;
+
+
+// --- utility functions ---
+// see http://www.reedbeta.com/blog/quick-and-easy-gpu-random-numbers-in-d3d11/	
+// for a good overview of PRNG on GPU (things like LCG vs Hashing)
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+uint rn_state;
+uint rand_xorshift()
+{
+    // Xorshift algorithm from George Marsaglia's paper
+    rn_state ^= (rn_state << 13);
+    rn_state ^= (rn_state >> 17);
+    rn_state ^= (rn_state << 5);
+    return rn_state;
+}
+void seed(uint s)
+{
+	rn_state = wang_hash(s);
+}
+
+float random()
+{
+	return float(rand_xorshift()) * (1.0 / 4294967296.0);
+}
+
+void updateVertexAdjacency(int vertex, int oldface, int newface)
+{
+	for (int j = 0; j < 4; ++j)
+		if (vertices[vertex].faces_0[j] == oldface)
+		{
+			vertices[vertex].faces_0[j] = newface;
+			return;
+		}
+
+	for (int j = 0; j < 4; ++j)
+		if (vertices[vertex].faces_1[j] == oldface)
+		{
+			vertices[vertex].faces_1[j] = newface;
+			return;
+		}
+}
+
+bool checkRiverBranchingAngle(const VertexAttrib riverAttrib, const dvec3 spring_position)
+{
+	return dot(riverAttrib.position.xyz - spring_position, riverAttrib.flow.xyz) > 0.0LF;
+}
+
+
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint i = gl_GlobalInvocationID.x  +  baseFaceIndex;
+	if (i > lastFaceIndex)
+		return;
+	
+	if ((faces[i].status & 255u) != 0u)
+		return;
+
+	const Face f = faces[i];
+	const Edge e0 = edges[f.e0];
+	const Edge e1 = edges[f.e1];
+	const Edge e2 = edges[f.e2];
+	int count = 0;
+	if ((e0.status & 255u) == 2u)
+		count++;
+	if ((e1.status & 255u) == 2u)
+		count++;
+	if ((e2.status & 255u) == 2u)
+		count++;	
+	if (count == 0)
+		return;
+	
+	uint faceLOD = f.status >> 8;
+	faces[i].status = (faceLOD << 8 ) | 1u;//split
+	
+	// --- Create 3 new subedges (of middle triangle) ---
+	const int vm0 = e0.vm;
+	const int vm1 = e1.vm;
+	const int vm2 = e2.vm;
+	const uint lod = e0.status >> 16;
+	
+	bool flip0 = false;
+	bool flip1 = false;
+	bool flip2 = false;//determine winding of edges (as they can appear in any order)
+	if (e0.v0 == e1.v0 || e0.v0 == e1.v1)
+		flip0 = true;
+	if (e1.v0 == e2.v0 || e1.v0 == e2.v1)
+		flip1 = true;
+	if (e2.v0 == e0.v0 || e2.v0 == e0.v1)
+		flip2 = true;
+
+	const int v0 = (flip0 ? e0.v1 : e0.v0);
+	const int v1 = (flip1 ? e1.v1 : e1.v0);
+	const int v2 = (flip2 ? e2.v1 : e2.v0);
+			
+	const int t0 = int(atomicCounterIncrement(faceCounter));		
+	const int t1 = int(atomicCounterIncrement(faceCounter));		
+	const int t2 = int(atomicCounterIncrement(faceCounter));		
+	const int t3 = int(atomicCounterIncrement(faceCounter));		
+	
+	Edge EM0;
+	EM0.v0 = vm2;
+	EM0.v1 = vm0;
+	EM0.vm = -1;
+	uint ghostv = (vertices[vm2].status == 1u || vertices[vm0].status == 1u) ? 1u:0;
+	EM0.status = ((lod + 1u) << 16) | (ghostv << 8);
+	EM0.child0 = -1;
+	EM0.child1 = -1;
+	EM0.f0 = t1;
+	EM0.f1 = t0;
+	EM0.type = TYPE_NONE;
+	const int em0 = int(atomicCounterIncrement(edgeCounter));		
+	edges[em0] = EM0;
+	
+	Edge EM1;
+	EM1.v0 = vm0;
+	EM1.v1 = vm1;
+	EM1.vm = -1;
+	ghostv = (vertices[vm0].status == 1u || vertices[vm1].status == 1u) ? 1u:0;
+	EM1.status = ((lod + 1u) << 16) | (ghostv << 8);
+	EM1.child0 = -1;
+	EM1.child1 = -1;
+	EM1.f0 = t2;
+	EM1.f1 = t0;
+	EM1.type = TYPE_NONE;
+	const int em1 = int(atomicCounterIncrement(edgeCounter));		
+	edges[em1] = EM1;
+	
+	Edge EM2;
+	EM2.v0 = vm1;
+	EM2.v1 = vm2;
+	EM2.vm = -1;
+	ghostv = (vertices[vm1].status == 1u || vertices[vm2].status == 1u) ? 1u:0;
+	EM2.status = ((lod + 1u) << 16) | (ghostv << 8);
+	EM2.child0 = -1;
+	EM2.child1 = -1;
+	EM2.f0 = t3;
+	EM2.f1 = t0;
+	EM2.type = TYPE_NONE;
+	const int em2 = int(atomicCounterIncrement(edgeCounter));		
+	edges[em2] = EM2;
+	
+	// --- Create 4 subtriangles (starting with the middle triangle) ---
+	Face T;
+	T.e0 = em0;
+	T.e1 = em1;
+	T.e2 = em2;
+	T.status = (faceLOD + 1u) << 8;	
+	//dvec3 p01 = (vattribs[vm1].position - vattribs[vm0].position).xyz;
+	//dvec3 p02 = (vattribs[vm2].position - vattribs[vm0].position).xyz;
+	//dvec3 n = normalize(cross(p01/renderScale, p02/renderScale));
+	//T.normal_x = float(n.x);
+	//T.normal_y = float(n.y);
+	//T.normal_z = float(n.z);
+	faces[t0] = T;
+	
+	int e00, e01;
+	if (edges[e0.child0].v0 == v0 || edges[e0.child0].v1 == v0)
+	{
+		e00 = e0.child0;
+		e01 = e0.child1;
+	}
+	else {
+		e00 = e0.child1;
+		e01 = e0.child0;
+	}
+	int e10, e11;
+	if (edges[e1.child0].v0 == v1 || edges[e1.child0].v1 == v1)
+	{
+		e10 = e1.child0;
+		e11 = e1.child1;
+	}
+	else {
+		e10 = e1.child1;
+		e11 = e1.child0;
+	}
+	int e20, e21;
+	if (edges[e2.child0].v0 == v2 || edges[e2.child0].v1 == v2)
+	{
+		e20 = e2.child0;
+		e21 = e2.child1;
+	}
+	else {
+		e20 = e2.child1;
+		e21 = e2.child0;
+	}
+	
+	/*const uint ty0 = vertices[v0].type;
+	const uint ty1 = vertices[v1].type;
+	const uint ty2 = vertices[v2].type;
+	const uint tym0 = vertices[vm0].type;
+	const uint tym1 = vertices[vm1].type;
+	const uint tym2 = vertices[vm2].type;
+	// Update river bank distances to avoid artifacts at high LOD
+	const double dist01 = distance(vattribs[vm0].position.xyz, vattribs[vm1].position.xyz);
+	const double dist12 = distance(vattribs[vm1].position.xyz, vattribs[vm2].position.xyz);
+	const double dist20 = distance(vattribs[vm2].position.xyz, vattribs[vm0].position.xyz);
+	if (tym0 == TYPE_RIVER)
+	{
+		double current_dist = vattribs[vm1].data.y;
+		double actual_dist = dist01;
+		if (tym2 == TYPE_RIVER)
+			actual_dist = min(actual_dist, dist12);
+		if (actual_dist < current_dist)
+			vattribs[vm1].data.y = actual_dist;
+		
+		current_dist = vattribs[vm2].data.y;
+		actual_dist = dist20;
+		if (tym1 == TYPE_RIVER)
+			actual_dist = min(actual_dist, dist12);
+		if (actual_dist < current_dist)
+			vattribs[vm2].data.y = actual_dist;
+	}
+	if (tym1 == TYPE_RIVER)
+	{
+		double current_dist = vattribs[vm0].data.y;
+		double actual_dist = dist01;
+		if (tym2 == TYPE_RIVER)
+			actual_dist = min(actual_dist, dist20);
+		if (actual_dist < current_dist)
+			vattribs[vm0].data.y = actual_dist;
+		
+		current_dist = vattribs[vm2].data.y;
+		actual_dist = dist12;
+		if (tym0 == TYPE_RIVER)
+			actual_dist = min(actual_dist, dist20);
+		if (actual_dist < current_dist)
+			vattribs[vm2].data.y = actual_dist;
+	}
+	if (tym2 == TYPE_RIVER)
+	{
+		double current_dist = vattribs[vm0].data.y;
+		double actual_dist = dist20;
+		if (tym1 == TYPE_RIVER)
+			actual_dist = min(actual_dist, dist01);
+		if (actual_dist < current_dist)
+			vattribs[vm0].data.y = actual_dist;
+		
+		current_dist = vattribs[vm1].data.y;
+		actual_dist = dist12;
+		if (tym0 == TYPE_RIVER)
+			actual_dist = min(actual_dist, dist01);
+		if (actual_dist < current_dist)
+			vattribs[vm2].data.y = actual_dist;
+	}*/
+	
+
+	T.e0 = e00;
+	T.e1 = em0;
+	T.e2 = e21;
+	T.status = (faceLOD + 1u) << 8;	
+	//p01 = (vattribs[vm0].position - vattribs[v0].position).xyz;
+	//p02 = (vattribs[vm2].position - vattribs[v0].position).xyz;
+	//n = normalize(cross(p01/renderScale, p02/renderScale));
+	//T.normal_x = float(n.x);
+	//T.normal_y = float(n.y);
+	//T.normal_z = float(n.z);
+	faces[t1] = T;
+		
+	T.e0 = e10;
+	T.e1 = em1;
+	T.e2 = e01;
+	T.status = (faceLOD + 1u) << 8;	
+	//p01 = (vattribs[vm1].position - vattribs[v1].position).xyz;
+	//p02 = (vattribs[vm0].position - vattribs[v1].position).xyz;
+	//n = normalize(cross(p01/renderScale, p02/renderScale));
+	//T.normal_x = float(n.x);
+	//T.normal_y = float(n.y);
+	//T.normal_z = float(n.z);
+	faces[t2] = T;
+	
+	T.e0 = e20;
+	T.e1 = em2;
+	T.e2 = e11;
+	T.status = (faceLOD + 1u) << 8;	
+	//p01 = (vattribs[vm2].position - vattribs[v2].position).xyz;
+	//p02 = (vattribs[vm1].position - vattribs[v2].position).xyz;
+	//n = normalize(cross(p01/renderScale, p02/renderScale));
+	//T.normal_x = float(n.x);
+	//T.normal_y = float(n.y);
+	//T.normal_z = float(n.z);
+	faces[t3] = T;
+	
+	// edge adjacency update
+	const int oldface = int(i);
+	if (edges[e00].f0 == oldface)
+		edges[e00].f0 = t1;
+	else edges[e00].f1 = t1;
+
+	if (edges[e01].f0 == oldface)
+		edges[e01].f0 = t2;
+	else edges[e01].f1 = t2;
+
+	if (edges[e10].f0 == oldface)
+		edges[e10].f0 = t2;
+	else edges[e10].f1 = t2;
+
+	if (edges[e11].f0 == oldface)
+		edges[e11].f0 = t3;
+	else edges[e11].f1 = t3;
+
+	if (edges[e20].f0 == oldface)
+		edges[e20].f0 = t3;
+	else edges[e20].f1 = t3;
+
+	if (edges[e21].f0 == oldface)
+		edges[e21].f0 = t1;
+	else edges[e21].f1 = t1;
+
+	// vertex adjacency update	
+	updateVertexAdjacency(v0, oldface, t1);//corner vertices
+	updateVertexAdjacency(v1, oldface, t2);
+	updateVertexAdjacency(v2, oldface, t3);
+	if (vertices[vm0].faces_0[0] == oldface)// middle vertices
+	{
+		vertices[vm0].faces_0[0] = t1;
+		vertices[vm0].faces_0[1] = t0;
+		vertices[vm0].faces_0[2] = t2;
+	}
+	else {
+		vertices[vm0].faces_1[0] = t1;
+		vertices[vm0].faces_1[1] = t0;
+		vertices[vm0].faces_1[2] = t2;
+	}
+	if (vertices[vm1].faces_0[0] == oldface)
+	{
+		vertices[vm1].faces_0[0] = t2;
+		vertices[vm1].faces_0[1] = t0;
+		vertices[vm1].faces_0[2] = t3;
+	}
+	else {
+		vertices[vm1].faces_1[0] = t2;
+		vertices[vm1].faces_1[1] = t0;
+		vertices[vm1].faces_1[2] = t3;
+	}
+	if (vertices[vm2].faces_0[0] == oldface)
+	{
+		vertices[vm2].faces_0[0] = t3;
+		vertices[vm2].faces_0[1] = t0;
+		vertices[vm2].faces_0[2] = t1;
+	}
+	else {
+		vertices[vm2].faces_1[0] = t3;
+		vertices[vm2].faces_1[1] = t0;
+		vertices[vm2].faces_1[2] = t1;
+	}
+	
+	
+	// River Primitives:
+	if (faceLOD == 18u && optionRiverPrimitives == 1u)
+	{
+		int faceIndex = int(i);
+		vertices[v0].prim0 = faceIndex;
+		vertices[v1].prim0 = faceIndex;
+		vertices[v2].prim0 = faceIndex;
+		vertices[vm0].prim0 = faceIndex;
+		vertices[vm1].prim0 = faceIndex;
+		vertices[vm2].prim0 = faceIndex;
+	}
+}

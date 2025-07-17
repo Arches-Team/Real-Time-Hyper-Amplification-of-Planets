@@ -1,0 +1,52 @@
+HOW TO
+
+
+Keyboard Commands :
+
+
+
+	TERRAIN GENERATION
+	------------------
+	T 	 	freeze/unfreeze tessellation update.
+	W		toggle generation of drainage patterns (ravins).
+	V		toggle generation of river profiles and valley profiles.
+	B		toggle blending of river profiles with raw terrain if river profiles are enabled.
+	E		toggle generation of lakes (not endoreic).
+
+	R		[deprecated] toggle generation of detailed subdivision based Relief (otherwise use only tectonic elevation + rivers + drainage + profiles)
+
+
+	RENDERING
+	---------	
+	F5		toggle HQ shading / debug shading
+	+	 	toggle FullHD mode.
+
+	
+	FALSE COLORS (debug shading only)
+	------------
+	F6 		toggle wireframe/filled triangles.
+	D		show drainage patterns in false colors.
+	P		show plateaux in false colors.
+	A 		show crust age in false colors (younger = colored).
+	Q		show valley profiles blend distance.
+	F		show normalized flow direction of rivers.
+	deprec	//G 		show ghost vertices.
+
+
+	EXPORT
+	------
+	C		take a screenshot
+	F9		start/stop saving camera frames to disk (no pre-recorded camera path, this is "live" mode)
+
+	F1		Start a new segment of the camera path and adds the first control point
+	F2		Record a new control point for the current segment of the camera path
+	F4		Start exporting the video frames for the current camera path (useful if in FullHD mode where the export button is not present)
+	K		Save the camera path on disk (default location).
+	L		Load the camera path from disk (default location).
+
+
+
+	MISC
+	----
+	F12		reload shaders
+

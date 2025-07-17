@@ -1,0 +1,325 @@
+#version 450
+
+// --- structures de données ---
+#define TYPE_NONE							0	
+#define TYPE_SEA							1		
+#define TYPE_CONTINENT						2
+#define TYPE_RIVER							3
+#define TYPE_COAST							4
+#define TYPE_RIDGE							5
+#define TYPE_DRAINAGE						6
+
+#define MAX_RIVER_BANK_EXTENT				50.0LF
+#define MIN_RIVER_BANK_EXTENT				4.0LF//1.6LF//
+
+#define RIVERBED_MIN_ANGLE_DEGREES			5.0
+#define RIVERBED_MAX_ANGLE_DEGREES			14.0
+
+#define RIVERBANK_MIN_ANGLE_DEGREES			3.5
+#define RIVERBANK_MAX_ANGLE_DEGREES			20.0
+
+
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Vertex
+{
+	/// first list of indexes of incident faces (or -1 if none)
+	int faces_0[4];
+	/// second list of indexes of incident faces (or -1 if none)
+	int faces_1[4];
+	/// PRNG seed
+	uint seed;
+	/// boolean = ghost or not ghost vertex
+	uint status;
+	//
+	uint type;
+	///
+	uint branch_count; 	
+	
+	/// some references (prim0 is used as a containing triangle index, for water animation ; prim1 is unused ; prim2 is a vertex reference used for lakes]
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;
+};
+struct Face
+{
+	/// indexes of the three edges.
+	int e0, e1, e2;
+	/// normal to the triangle
+	float normal_x, normal_y, normal_z;
+	/// LSB to MSB : byte 0 = boolean (split 1 or not 0), byte 2 = lod
+	uint status;
+	//
+	uint type;
+};
+struct VertexAttrib
+{
+	/// xyz = world position (km), w = altitude (km)
+	dvec4 position;
+	/// x = nearest river altitude, y = distance to nearest river, z = tectonic altitude, w = water altitude
+	dvec4 data;
+	/// xyz = normalized flow direction, w = unused
+	vec4 flow;
+	/// x = nearest ravin altitude, y = distance to nearest ravin
+	vec4 misc1;
+	/// unused
+	vec4 misc2;
+	//
+	vec4 padding_and_debug;
+};
+struct WaterVertexAttrib
+{
+	/// xyz = 3D position, w = average water altitude (before wave displacement)
+	dvec4 position;
+	/// xyz = normal to water surface, w = unused
+	vec4 normal;
+	/// xyz = water flow direction normalized, w = unused
+	vec4 flow;
+	
+	/// indexes of the vertices acting as river primitives
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;
+	
+	ivec4 padding2;
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) readonly buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 1, std430) readonly buffer faces_buffer 
+{
+  Face faces[];
+};
+layout(binding = 2, std430) readonly buffer vertices_buffer
+{
+	Vertex vertices[];
+};
+layout(binding = 3, std430) coherent buffer vattribs_buffer 
+{
+  VertexAttrib vattribs[];
+};
+layout(binding = 4, std430) writeonly buffer water_vattribs_buffer 
+{
+  WaterVertexAttrib water_vattribs[];
+};
+
+// --- uniforms ---
+uniform uint lastVertexIndex;
+
+uniform double planetRadiusKm;
+uniform double seaLevelKm;
+
+uniform uint optionBlendProfileAndTerrain;
+uniform uint optionGenerateDrainage;
+uniform uint optionGenerateRiverProfiles;
+uniform uint optionRiverPrimitives;
+
+uniform sampler2D riverbankProfilesTexture;
+uniform sampler3D noiseTexture;
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint index = gl_GlobalInvocationID.x;
+	if (index > lastVertexIndex)
+		return;
+
+	const Vertex V = vertices[index];
+	const VertexAttrib attrib = vattribs[index];
+	const double max_elevation = attrib.data.z;
+	double water_elevation = attrib.data.w;// + 0.004LF * smoothstep(seaLevelKm, seaLevelKm + 0.5LF, max_elevation);//artificial boost to water depth (don't do this)
+		
+	// --- river profiles ---
+	double ground_elevation = attrib.position.w;
+	//const double raw_elevation = ground_elevation;
+	const bool ocean_case = ground_elevation < seaLevelKm;
+	float debug_lerp_profile = 2.0;
+	bool water_within_bed = true;//unused
+	
+	if (!ocean_case)
+	{				
+		// make rivers
+		//water_within_bed = false;
+		
+		const double nearest_river_elevation = attrib.data.x;
+		const double distance2river = attrib.data.y;
+		
+		const double lerpd = double(1.0 - pow(clamp(attrib.flow.w, 0.0, 1.0), 0.5));		
+		double RIVER_BANK_MAX_DISTANCE = mix(MAX_RIVER_BANK_EXTENT, MIN_RIVER_BANK_EXTENT, lerpd);
+		RIVER_BANK_MAX_DISTANCE *= double(0.25 + 0.75 * texture(noiseTexture, vec3(attrib.position.xyz *0.005LF)).r);//add noise variation
+			
+		//double profile_offset_from_raw_terrain = 0.0LF;
+		
+		if (optionGenerateRiverProfiles == 1u && distance2river < RIVER_BANK_MAX_DISTANCE)
+		{	
+			const float riverbed_angle = mix(RIVERBED_MIN_ANGLE_DEGREES, RIVERBED_MAX_ANGLE_DEGREES, float(lerpd));
+			const double riverbed_slope = double(tan(riverbed_angle * 3.14159 / 180.0));
+			const double riverbed_distance = (water_elevation - nearest_river_elevation + 0.001LF /*add 1 meter to depth so we can see something near springs*/) / riverbed_slope;
+			
+			const double raw_bank_lerp = smoothstep(0.005LF, 0.3LF, ground_elevation - water_elevation);//try and detect existing raw bank type : either flat or steep
+			float riverbank_angle = mix(RIVERBANK_MIN_ANGLE_DEGREES, RIVERBANK_MAX_ANGLE_DEGREES, float(lerpd));
+			riverbank_angle = mix(RIVERBANK_MIN_ANGLE_DEGREES, riverbank_angle, float(raw_bank_lerp));			
+			const double riverbank_slope = double(tan(riverbank_angle * 3.14159 / 180.0));
+		
+			double profile_elevation;
+			double cliff_hack = 0.0LF;
+			
+			if (distance2river < riverbed_distance)
+			{
+				double  lerp = distance2river / riverbed_distance;
+				lerp = smoothstep(0.0LF, 1.0LF, lerp);
+				profile_elevation = (nearest_river_elevation - 0.001LF) + lerp * riverbed_distance * riverbed_slope;
+				//water_within_bed = true;				
+			} 
+			else 
+			{
+				double bank_lerp = (distance2river - riverbed_distance) / (RIVER_BANK_MAX_DISTANCE - riverbed_distance);
+				//water_within_bed = (distance2river - riverbed_distance) < 0.016LF;
+				
+				//float dummy;
+				//const vec2 tex_coords = vec2(float(bank_lerp), attrib.misc2.w);
+				//const double profile_data = double(texture(riverbankProfilesTexture, tex_coords).r);	
+				//profile_elevation = (nearest_river_elevation + riverbed_distance * riverbed_slope) + profile_data * riverbank_slope * (RIVER_BANK_MAX_DISTANCE - riverbed_distance);		
+				
+				//bank_lerp = mix(bank_lerp, bank_lerp * bank_lerp, 0.25LF);
+				//bank_lerp = sqrt(bank_lerp);
+				bank_lerp = mix(bank_lerp, bank_lerp * bank_lerp, 0.5LF);
+				bank_lerp = mix(bank_lerp*bank_lerp, bank_lerp, smoothstep(seaLevelKm, seaLevelKm + 1.5LF, max_elevation));	//this looks a bit better in plains
+				profile_elevation = ((nearest_river_elevation - 0.001LF) + riverbed_distance * riverbed_slope) + bank_lerp * riverbank_slope * (RIVER_BANK_MAX_DISTANCE - riverbed_distance);								
+				
+				//
+				ground_elevation = max(water_elevation + 0.0015LF, ground_elevation);//ensure no unwanted water presence outside river locations.
+				//profile_elevation = max(water_elevation + 0.002LF, profile_elevation);//does this have any effect??
+				
+				// cliff hack:
+				cliff_hack = 1.0LF - smoothstep(seaLevelKm, seaLevelKm + 0.11LF, ground_elevation);	//serves to hide artifacts near the ocean (otherwise sharp cliff where linear profile meets the sea)
+				
+				// add noise:
+				profile_elevation += smoothstep(-0.02LF, 0.2LF, bank_lerp) * 0.125LF * texture(noiseTexture, vec3(attrib.position.xyz *0.1LF)).r;								
+			}
+			
+			profile_elevation = min(profile_elevation, max_elevation);
+			//profile_elevation = min(profile_elevation, ground_elevation + 0.5LF);
+			
+			const double lerp_distance = distance2river / RIVER_BANK_MAX_DISTANCE;			
+			debug_lerp_profile = float(lerp_distance);
+			double terrain_blend_coeff = lerp_distance + cliff_hack;			
+									
+			double modified_elevation;
+			if (optionBlendProfileAndTerrain == 1u)
+			{
+				terrain_blend_coeff = smoothstep(0.25LF, 1.0LF, terrain_blend_coeff);
+				modified_elevation = mix(profile_elevation, ground_elevation, clamp(terrain_blend_coeff, 0.0LF, 1.0LF));
+			}else 
+				modified_elevation = profile_elevation;			
+			
+			//profile_offset_from_raw_terrain = modified_elevation - ground_elevation;//keep track of the offset applied to the terrain by the valley profile.
+			ground_elevation = modified_elevation;			
+						
+		}
+			
+		if (distance2river > RIVER_BANK_MAX_DISTANCE)
+		{//ensure no unwanted water presence 
+			ground_elevation = max(water_elevation + 0.002LF, ground_elevation);
+		}	
+		/*else {
+			float g = 1.0 - float(distance2river/RIVER_BANK_MAX_DISTANCE);
+			g *=g;
+			vattribs[index].misc2.z = clamp(vattribs[index].misc2.z - 1.0 * g*g*g, 0.0, 1.0);//make desert greenish near rivers... 
+		}*/
+		
+			
+		
+		// --- make ravins  ---
+		/*const double distance2ravin = double(attrib.misc1.y);
+		const double nearest_ravin_elevation = double(attrib.misc1.x);
+		float ravinlerp = clamp(attrib.misc1.w, 0.0, 1.0);
+		//ravinlerp = sqrt(ravinlerp);
+		const double RAVIN_BANK_MAX_DISTANCE = mix(0.1LF, 8.0LF, double(ravinlerp));
+		if (false && optionGenerateDrainage == 1u && distance2ravin < RAVIN_BANK_MAX_DISTANCE)	//  --- DEACTIVATED FOR NOW ---
+		{
+			const float ravinbank_angle = mix(7.0, 33.0, ravinlerp);//mix(8.0, 25.0, smoothstep(0.0, 1.5, float(max_elevation - seaLevelKm)));
+			const double ravinbank_slope = double(tan(ravinbank_angle * 3.14159 / 180.0));
+					
+			double profile_elevation = nearest_ravin_elevation + distance2ravin * ravinbank_slope;			
+			profile_elevation = min(profile_elevation, max_elevation);
+					
+			double lerp_distance = distance2ravin / RAVIN_BANK_MAX_DISTANCE;
+			//debug_lerp_profile = float(lerp_distance);//clamp(attrib.misc1.y / 8.0, 0.0, 1.0);//float(lerp_distance);
+			//debug_lerp_profile = ravinlerp;
+			//lerp_distance = smoothstep(0.0LF, 1.0LF, lerp_distance);
+			//profile_elevation = max(ground_elevation - 0.03LF * (1.0LF - lerp_distance), profile_elevation);
+			
+			const double lerp_river_bank = 1.0LF;//clamp(distance2river / 0.5LF, 0.0LF, 1.0LF);
+			//profile_elevation = min(ground_elevation, profile_elevation);
+			//profile_elevation = max(ground_elevation - 0.2LF * double(ravinlerp), profile_elevation);
+			//double postravin_elevation = mix(ground_elevation, profile_elevation, (1.0LF - lerp_distance) * lerp_river_bank);	
+								
+			//profile_elevation = mix(min(ground_elevation -0.1LF, profile_elevation), profile_elevation, lerp_distance * lerp_distance);					
+			//profile_elevation += profile_offset_from_raw_terrain;// - 0.3LF * ravinlerp * (1.0LF - lerp_distance);
+			//profile_elevation -= 0.25LF * sqrt(ravinlerp);
+			profile_elevation = min(ground_elevation, profile_elevation);
+			profile_elevation = max(water_elevation + 0.001LF, profile_elevation);
+			double postravin_elevation = mix(ground_elevation, profile_elevation, (1.0LF - lerp_distance) * lerp_river_bank);
+			
+			ground_elevation = postravin_elevation;
+		}*/
+		
+		// write back:
+		vattribs[index].position.xyz = normalize(attrib.position.xyz) * (planetRadiusKm + ground_elevation);
+		vattribs[index].position.w = ground_elevation;		
+	}
+	
+	//vattribs[index].misc2.y = debug_lerp_profile;
+	vattribs[index].padding_and_debug.y = debug_lerp_profile;
+		
+		
+	// --- add water vertex ---	
+	float aridity = attrib.misc2.z;
+	water_elevation -= double(0.025 * aridity * aridity);//make dry river beds in deserts !
+	
+	bool water_ok = water_within_bed && ((ground_elevation - 0.012LF) < water_elevation);//ensure terrain is (rouhgly) below water
+	//water_ok = water_ok && ((water_elevation > seaLevelKm + 0.0015LF && attrib.data.y < 1.0LF) || (water_elevation < seaLevelKm + 0.0015LF));//ensure either river distance is small enough (< 1km), or that we're dealing with the sea.
+				//not needed anymore (the distance culling is now performed right above at profile generation, and better)		
+				
+	if (water_ok) //create water vertex:
+	{
+		//const bool rivernotok = attrib.data.w > float(seaLevelKm) && attrib.flow.xyz == vec3(0.0);//=> TODO [Long Term]: assign flow direction to ocean too... 
+		//if (rivernotok)
+		//	water_vattribs[index] = WaterVertexAttrib(dvec4(0.0LF), vec4(0.0), attrib.flow);//else marker : no water vertex here		
+		//else {
+			dvec4 p = attrib.position;
+			p.w = water_elevation;
+			p.xyz = normalize(p.xyz) * (planetRadiusKm + p.w);						
+			const bool ghostVertex = (V.status == 1u);
+			//water_vattribs[index] = WaterVertexAttrib(p, vec4(0.0, 0.0, 0.0, ghostVertex ? -1.0: 0.0), attrib.flow, V.prim0, V.prim1, V.prim2, 0, ivec4(0));					
+			water_vattribs[index] = WaterVertexAttrib(p, vec4(0.0, 0.0, 0.0, ghostVertex ? -1.0: 0.0), attrib.flow, water_elevation > seaLevelKm ? V.prim0 : -1, -1, -1, 0, ivec4(0));					
+		//}
+	}
+	else {
+		water_vattribs[index] = WaterVertexAttrib(dvec4(0.0LF), vec4(0.0), attrib.flow, -1, -1, -1, 0, ivec4(0));//else marker : no water vertex here		
+	}	
+}

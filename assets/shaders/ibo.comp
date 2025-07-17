@@ -1,0 +1,215 @@
+#version 450
+
+// --- structures de données ---
+#define TYPE_NONE							0	
+#define TYPE_SEA							1		
+#define TYPE_CONTINENT						2
+#define TYPE_RIVER							3
+#define TYPE_COAST							4
+#define TYPE_RIDGE							5
+#define TYPE_DRAINAGE						6
+
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Vertex
+{
+	/// first list of indexes of incident faces (or -1 if none)
+	int faces_0[4];
+	/// second list of indexes of incident faces (or -1 if none)
+	int faces_1[4];
+	/// PRNG seed
+	uint seed;
+	/// boolean = ghost or not ghost vertex
+	uint status;
+	//
+	uint type;
+	///
+	uint branch_count; 	
+	/// indexes of the vertices acting as river primitives
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;		
+	//int pad[4];
+};
+struct Face
+{
+	/// indexes of the three edges.
+	int e0, e1, e2;
+	/// normal to the triangle
+	float normal_x, normal_y, normal_z;
+	/// LSB to MSB : byte 0 = boolean (split 1 or not 0), byte 2 = lod
+	uint status;
+	//
+	uint type;
+};
+struct VertexAttrib
+{
+	/// xyz = world position (km), w = altitude (km)
+	dvec4 position;
+	/// x = nearest river altitude, y = distance to nearest river, z = tectonic altitude, w = water altitude
+	dvec4 data;
+	/// xyz = normalized flow direction, w = unused
+	vec4 flow;
+	/// x = nearest ravin altitude, y = distance to nearest ravin
+	vec4 misc1;
+	/// unused
+	vec4 misc2;
+	//
+	vec4 padding_and_debug;
+};
+struct WaterVertexAttrib
+{
+	/// xyz = 3D position, w = average water altitude (before wave displacement)
+	dvec4 position;
+	/// xyz = normal to water surface, w = unused
+	vec4 normal;
+	/// xyz = water flow direction normalized, w = unused
+	vec4 flow;
+	
+	/// indexes of the vertices acting as river primitives
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;	
+	ivec4 padding2;	
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) readonly buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 1, std430) readonly buffer faces_buffer 
+{
+  Face faces[];
+};
+layout(binding = 2, std430) readonly buffer vattribs_buffer 
+{
+  VertexAttrib vattribs[];
+};
+layout(binding = 6, std430) readonly buffer water_vattribs_buffer 
+{
+  WaterVertexAttrib water_vattribs[];
+};
+layout(binding = 3, std430) writeonly buffer ibo_buffer 
+{
+  uint indices[];
+};
+layout(binding = 4, std430) writeonly buffer water_ibo_buffer 
+{
+  uint water_indices[];
+};
+
+// --- atomic counters ---
+layout (binding = 5, offset = 0) uniform atomic_uint iboCounter;
+layout (binding = 7, offset = 0) uniform atomic_uint waterIboCounter;
+
+// --- uniforms ---
+uniform uint lastFaceIndex;
+uniform dvec3 cameraPosition;
+uniform double renderScale;
+uniform double planetRadiusKm;
+uniform double seaLevelKm;
+
+uniform dmat4 projview;
+
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint i = gl_GlobalInvocationID.x;
+	if (i > lastFaceIndex)
+		return;
+
+	if ((faces[i].status  & 255u) != 0)
+		return;
+
+	const Face f = faces[i];
+	const Edge e0 = edges[f.e0];
+	const Edge e1 = edges[f.e1];
+	const Edge e2 = edges[f.e2];	
+	bool flip0 = false;
+	bool flip1 = false;
+	bool flip2 = false;//determine winding of edges (as they can appear in any order)	
+	if (e0.v0 == e1.v0 || e0.v0 == e1.v1)
+		flip0 = true;
+	if (e1.v0 == e2.v0 || e1.v0 == e2.v1)
+		flip1 = true;
+	if (e2.v0 == e0.v0 || e2.v0 == e0.v1)
+		flip2 = true;
+	const uint v0 = uint(flip0 ? e0.v1 : e0.v0);
+	const uint v1 = uint(flip1 ? e1.v1 : e1.v0);
+	const uint v2 = uint(flip2 ? e2.v1 : e2.v0);
+	
+	// --- ADD WATER TRIANGLES TO RENDER ---
+	const WaterVertexAttrib wattrib0 = water_vattribs[v0];
+	const WaterVertexAttrib wattrib1 = water_vattribs[v1];
+	const WaterVertexAttrib wattrib2 = water_vattribs[v2];
+	const dvec4 NOVERTEX = dvec4(0.0LF); 
+	if (wattrib0.position != NOVERTEX && wattrib1.position != NOVERTEX && wattrib2.position != NOVERTEX)
+	{
+		const uint lod = f.status >> 8;
+		const uint minlod = uint(mix(14.0, 12.0, sqrt(wattrib0.flow.w)));
+		const double averagewateraltitude = 0.3333333LF * (wattrib0.position.w + wattrib1.position.w + wattrib2.position.w);
+		if (! (averagewateraltitude > seaLevelKm + 0.004LF && lod < minlod) )//don't render rivers for orbit views
+		{			
+			uint water_tri_index = atomicCounterIncrement(waterIboCounter);
+			water_indices[3*water_tri_index] = v0;
+			water_indices[3*water_tri_index + 1] = v1;
+			water_indices[3*water_tri_index + 2] = v2;		
+		}
+	}
+	
+	// --- ADD TERRAIN TRIANGLES ---
+	const VertexAttrib attrib0 = vattribs[v0];
+	const VertexAttrib attrib1 = vattribs[v1];
+	const VertexAttrib attrib2 = vattribs[v2];
+	
+	// Frustum culling (gives 2 to 3 Hz saving, which is not much...):
+	dvec4 p0 = projview * dvec4(attrib0.position.xyz/renderScale, 1.0LF);
+	p0.xyz /= p0.w;
+	dvec4 p1 = projview * dvec4(attrib1.position.xyz/renderScale, 1.0LF);
+	p1.xyz /= p1.w;
+	dvec4 p2 = projview * dvec4(attrib2.position.xyz/renderScale, 1.0LF);
+	p2.xyz /= p2.w;
+	
+	if (p0.x < -1.0LF && p1.x < -1.0LF && p2.x < -1.0LF)
+		return;
+	if (p0.x > 1.0LF && p1.x > 1.0LF && p2.x > 1.0LF)
+		return;
+	if (p0.y < -1.0LF && p1.y < -1.0LF && p2.y < -1.0LF)
+		return;
+	if (p0.y > 1.0LF && p1.y > 1.0LF && p2.y > 1.0LF)
+		return;
+	if (p0.z < -1.2LF && p1.z < -1.2LF && p2.z < -1.2LF)
+		return;
+	
+	vec3 cam2tri = vec3(normalize(attrib0.position.xyz / renderScale - cameraPosition));
+	if (dot(cam2tri, attrib0.misc1.xyz) < 0.0 || dot(cam2tri, attrib1.misc1.xyz) < 0.0 || dot(cam2tri, attrib2.misc1.xyz) < 0.0)//cull back-facing triangle
+	{		
+		// add triangle for rendering
+		uint index = atomicCounterIncrement(iboCounter);
+		indices[3*index] = v0;
+		indices[3*index+1] = v1;
+		indices[3*index+2] = v2;
+	}	
+}

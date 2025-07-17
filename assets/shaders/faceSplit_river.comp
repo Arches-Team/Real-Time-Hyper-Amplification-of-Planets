@@ -1,0 +1,1052 @@
+#version 450
+
+// --- structures de données ---
+#define TYPE_NONE							0	
+#define TYPE_SEA							1		
+#define TYPE_CONTINENT						2
+#define TYPE_RIVER							3
+#define TYPE_COAST							4
+#define TYPE_RIDGE							5
+#define TYPE_DRAINAGE						6
+#define TYPE_LAKE_SHORE						8
+#define TYPE_OCTAHEDRON_EDGE				16
+
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Vertex
+{
+	/// first list of indexes of incident faces (or -1 if none)
+	int faces_0[4];
+	/// second list of indexes of incident faces (or -1 if none)
+	int faces_1[4];
+	/// PRNG seed
+	uint seed;
+	/// boolean = ghost or not ghost vertex
+	uint status;
+	//
+	uint type;
+	///
+	uint branch_count; 
+
+	/// some references (prim0 is used as a containing triangle index, for water animation ; prim1 is unused ; prim2 is a vertex reference used for lakes]
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;	
+	//int pad[4];
+};
+struct Face
+{
+	/// indexes of the three edges.
+	int e0, e1, e2;
+	/// normal to the triangle
+	float normal_x, normal_y, normal_z;
+	/// LSB to MSB : byte 0 = boolean (split 1 or not 0), byte 2 = lod
+	uint status;
+	//
+	uint type;
+};
+struct VertexAttrib
+{
+	/// xyz = world position (km), w = altitude (km)
+	dvec4 position;
+	/// x = nearest river altitude, y = distance to nearest river, z = tectonic altitude, w = water altitude
+	dvec4 data;
+	/// xyz = normalized flow direction, w = unused
+	vec4 flow;
+	/// x = nearest ravin altitude, y = distance to nearest ravin
+	vec4 misc1;
+	/// x = tectonic age (in Ma), y = plateau presence in [0, 1],  z = unused, w = river profile indirection
+	vec4 misc2;
+	//
+	vec4 padding_and_debug;
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) coherent buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 1, std430) coherent buffer vertices_buffer 
+{
+  Vertex vertices[];
+};
+layout(binding = 2, std430) coherent buffer faces_buffer 
+{
+  Face faces[];
+};
+layout(binding = 3, std430) coherent buffer vattribs_buffer 
+{
+  VertexAttrib vattribs[];
+};
+
+// --- atomic counters ---
+layout (binding = 5, offset = 0) uniform atomic_uint edgeCounter;
+layout (binding = 6, offset = 0) uniform atomic_uint vertexCounter;
+layout (binding = 7, offset = 0) uniform atomic_uint faceCounter;
+
+// --- uniforms ---
+uniform uint baseFaceIndex;
+uniform uint lastFaceIndex;
+uniform double planetRadiusKm;
+uniform double seaLevelKm;
+uniform double renderScale;
+
+uniform uint optionGenerateDrainage;
+
+const float springFlowValueDefault = 0.01;
+
+// --- utility functions ---
+// see http://www.reedbeta.com/blog/quick-and-easy-gpu-random-numbers-in-d3d11/	
+// for a good overview of PRNG on GPU (things like LCG vs Hashing)
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+uint rn_state;
+uint rand_xorshift()
+{
+    // Xorshift algorithm from George Marsaglia's paper
+    rn_state ^= (rn_state << 13);
+    rn_state ^= (rn_state >> 17);
+    rn_state ^= (rn_state << 5);
+    return rn_state;
+}
+void seed(uint s)
+{
+	rn_state = wang_hash(s);
+}
+
+float random()
+{
+	return float(rand_xorshift()) * (1.0 / 4294967296.0);
+}
+
+void updateVertexAdjacency(int vertex, int oldface, int newface)
+{
+	for (int j = 0; j < 4; ++j)
+		if (vertices[vertex].faces_0[j] == oldface)
+		{
+			vertices[vertex].faces_0[j] = newface;
+			return;
+		}
+
+	for (int j = 0; j < 4; ++j)
+		if (vertices[vertex].faces_1[j] == oldface)
+		{
+			vertices[vertex].faces_1[j] = newface;
+			return;
+		}
+}
+
+bool checkRiverBranchingAngle(const VertexAttrib riverAttrib, const dvec3 spring_position)
+{
+	return dot(riverAttrib.position.xyz - spring_position, riverAttrib.flow.xyz) > 0.0LF;
+}
+
+
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint i = gl_GlobalInvocationID.x  +  baseFaceIndex;
+	if (i > lastFaceIndex)
+		return;
+	
+	if ((faces[i].status & 255u) != 0u)
+		return;
+
+	const Face f = faces[i];
+	const Edge e0 = edges[f.e0];
+	const Edge e1 = edges[f.e1];
+	const Edge e2 = edges[f.e2];
+	int count = 0;
+	if ((e0.status & 255u) == 2u)
+		count++;
+	if ((e1.status & 255u) == 2u)
+		count++;
+	if ((e2.status & 255u) == 2u)
+		count++;	
+	if (count == 0)
+		return;
+	
+	uint faceLOD = f.status >> 8;
+	faces[i].status = (faceLOD << 8 ) | 1u;//split
+	const uint lod = e0.status >> 16;
+	const float lodf = clamp(float(lod) - 8.0, 0.0, 24.0);
+	
+	// --- Create 3 new subedges (of middle triangle) ---
+	const int vm0 = e0.vm;
+	const int vm1 = e1.vm;
+	const int vm2 = e2.vm;	
+	
+	const Vertex vertexm0 = vertices[vm0];
+	const Vertex vertexm1 = vertices[vm1];
+	const Vertex vertexm2 = vertices[vm2];	
+	VertexAttrib attribm0 = vattribs[vm0];
+	VertexAttrib attribm1 = vattribs[vm1];
+	VertexAttrib attribm2 = vattribs[vm2];
+	
+			
+	//determine winding of edges (as they can appear in any order)
+	bool flip0 = false;
+	bool flip1 = false;
+	bool flip2 = false;
+	if (e0.v0 == e1.v0 || e0.v0 == e1.v1)
+		flip0 = true;
+	if (e1.v0 == e2.v0 || e1.v0 == e2.v1)
+		flip1 = true;
+	if (e2.v0 == e0.v0 || e2.v0 == e0.v1)
+		flip2 = true;
+
+	const int v0 = (flip0 ? e0.v1 : e0.v0);
+	const int v1 = (flip1 ? e1.v1 : e1.v0);
+	const int v2 = (flip2 ? e2.v1 : e2.v0);	
+	
+	bool makesubriver = lodf < 2.0;// || (attribm0.position.w > seaLevelKm + 0.3LF);//either make long subrivers either do it only on high ground//
+	//bool makesubriver = false;	
+		
+	//const double z = clamp(mix(vattribs[v0].data.z, vattribs[v0].position.w, 0.5LF) - seaLevelKm, 0.0LF, 3.0LF)/3.0LF;	//note: should be done at junction level...
+	//uint river_proba = uint(mix(0.0LF, 100.0LF, 1.0LF - z));
+	uint river_proba = 0;//uint(100.0 * smoothstep(0.0, 5.0, lodf));
+	const double max_slope = double(tan(1.0 * 3.1415926 / 180.0));//max slope of new river branches  :1 °
+						
+	const int t0 = int(atomicCounterIncrement(faceCounter));		
+	const int t1 = int(atomicCounterIncrement(faceCounter));		
+	const int t2 = int(atomicCounterIncrement(faceCounter));		
+	const int t3 = int(atomicCounterIncrement(faceCounter));		
+	
+	Edge EM0;
+	EM0.v0 = vm2;
+	EM0.v1 = vm0;
+	EM0.vm = -1;
+	uint ghostv = (vertexm2.status == 1u || vertexm0.status == 1u) ? 1u:0;
+	EM0.status = ((lod + 1u) << 16) | (ghostv << 8);
+	EM0.child0 = -1;
+	EM0.child1 = -1;
+	EM0.f0 = t1;
+	EM0.f1 = t0;
+	EM0.type = TYPE_NONE;
+	if (ghostv == 0)
+	{// check if we can make a subriver:
+		if (e2.type == TYPE_RIVER && e0.type != TYPE_RIVER && e0.type != TYPE_DRAINAGE && (attribm0.data.y != 0.0LF && vertexm0.type != TYPE_LAKE_SHORE) && vertexm1.type != TYPE_LAKE_SHORE && vertices[v1].type != TYPE_LAKE_SHORE)
+		{			
+			const VertexAttrib junction = attribm2;
+			//seed(vertexm0.seed);
+			//uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 );				
+			seed(vertexm2.seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 ); 
+			if (i == aface)// && i == aface2)
+			{	
+				if (checkRiverBranchingAngle(junction, attribm0.position.xyz) && attribm0.position.w > junction.position.w)//&& vattribs[v1].position.w > junction.position.w)// && junction.flow.w < 1.0)//vm0 is the new spring
+				{
+					river_proba = uint(100.0 * smoothstep(0.0, 0.5, junction.flow.w));
+					if ((rand_xorshift() % 128) > river_proba && makesubriver && junction.data.w != junction.position.w && junction.data.w > seaLevelKm + 0.2LF)
+					{
+						vertices[vm2].branch_count = 1u;
+						//vertices[vm0].type = TYPE_RIVER;
+						EM0.type = TYPE_RIVER;			
+						//VertexAttrib spring = attribm0;						
+						//const double edgelen = distance(junction.position.xyz, spring.position.xyz);
+						//const double max_spring_offset = min(1.5LF, max_slope * edgelen);
+						//double spring_altitude = min(vattribs[v1].position.w - 0.02LF, junction.position.w + (0.05LF + random()*0.95LF) * max_spring_offset); 
+						//spring_altitude = max(spring_altitude, seaLevelKm + 0.004LF);
+						//spring.position.xyz = normalize(spring.position.xyz) * (planetRadiusKm + spring_altitude);
+						//spring.position.w = spring_altitude;
+						//spring.data.x = spring_altitude;
+						//spring.data.y = 0.0LF;
+						//spring.data.w = spring_altitude;//make a spring (ie., water altitude = ground altitude)
+						//spring.flow = vec4(vec3(normalize(junction.position.xyz - spring.position.xyz)), springFlowValueDefault);
+						//vattribs[vm0].misc2.w = junction.misc2.w + 0.05*random();//river profile at spring : make it only a slight deviation from the profile at the junction, in order to avoid artefacts for short rivers.
+						//spring.padding_and_debug.w = 0.0;
+						//vattribs[vm0] = spring;
+						//makesubriver = false;
+					}
+					else if (optionGenerateDrainage == 1u)//if (e0.type != TYPE_DRAINAGE)
+					{
+						EM0.type = TYPE_DRAINAGE;		
+						vertices[vm0].type = TYPE_DRAINAGE;
+						vattribs[vm0].misc1 = vec4(float(attribm0.position.w), 0.0, 0.0, 0.0);
+						
+						const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm0].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+						vattribs[vm2].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+					}
+				}
+				else if (optionGenerateDrainage == 1u && vattribs[v1].position.w > junction.position.w)
+				{
+					EM0.type = TYPE_DRAINAGE;					
+					vertices[vm0].type = TYPE_DRAINAGE;
+					vattribs[vm0].misc1 = vec4(float(attribm0.position.w), 0.0, 0.0, 0.0);
+					
+					const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm0].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+					vattribs[vm2].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+				}
+			}
+			//else if (/*e0.type != TYPE_DRAINAGE && */vattribs[v1].position.w > junction.position.w + 0.02LF)
+			//{
+			//	EM0.type = TYPE_DRAINAGE;			
+			//}
+		} 
+		/*else if (e2.type == TYPE_DRAINAGE && e0.type != TYPE_DRAINAGE && e0.type != TYPE_RIVER && vertices[vm0].type != TYPE_RIVER)
+		{			
+			seed(vertices[vm0].seed);
+			uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 );				
+			seed(vertices[vm2].seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 ); 				
+			if (i == aface && i == aface2)
+			{	
+				//vertices[vm0].type = TYPE_DRAINAGE;
+				EM0.type = TYPE_DRAINAGE;
+			}
+		}*/
+		else if (e2.type != TYPE_RIVER && e0.type == TYPE_RIVER && e2.type != TYPE_DRAINAGE && attribm2.data.y != 0.0LF && vertexm2.type != TYPE_LAKE_SHORE && vertexm1.type != TYPE_LAKE_SHORE && vertices[v2].type != TYPE_LAKE_SHORE)
+		{
+			const VertexAttrib junction = attribm0;
+			//seed(vertexm2.seed);
+			//uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 );				
+			seed(vertexm0.seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 ); 	
+			if (i == aface)// && i == aface2)
+			{
+				if (checkRiverBranchingAngle(junction, attribm2.position.xyz) && attribm2.position.w > junction.position.w)// && junction.flow.w < 1.0)//vm2 is the new spring
+				{
+					river_proba = uint(100.0 * smoothstep(0.0, 0.5, junction.flow.w));
+					//oldtype = atomicCompSwap(vertices[vm2].type, oldtype, TYPE_RIVER);//prevent race conditions on this vertex
+					if ((rand_xorshift() % 128) > river_proba && makesubriver && junction.data.w != junction.position.w && junction.data.w > seaLevelKm + 0.2LF)// && vertices[vm2].type != TYPE_RIDGE)
+					{
+						vertices[vm0].branch_count = 1u;
+						//vertices[vm2].type = TYPE_RIVER;
+						EM0.type = TYPE_RIVER;	
+						//VertexAttrib spring = attribm2;	
+						//const double edgelen = distance(junction.position.xyz, spring.position.xyz);
+						//const double max_spring_offset = min(1.5LF, max_slope * edgelen);
+						//double spring_altitude = min(vattribs[v2].position.w - 0.02LF, junction.position.w + double(0.05 + random()*0.95) * max_spring_offset); 
+						//spring_altitude = max(spring_altitude, seaLevelKm + 0.004LF);
+						//spring.position.xyz = normalize(spring.position.xyz) * (planetRadiusKm + spring_altitude);
+						//spring.position.w = spring_altitude;
+						//spring.data.x = spring_altitude;
+						//spring.data.y = 0.0LF;
+						//spring.data.w = spring_altitude;//make a spring (ie., water altitude = ground altitude)
+						//spring.flow = vec4(vec3(normalize(junction.position.xyz - spring.position.xyz)), springFlowValueDefault);
+						//vattribs[vm2].misc2.w = junction.misc2.w + 0.05*random();//river profile at spring : make it only a slight deviation from the profile at the junction, in order to avoid artefacts for short rivers.
+						//spring.padding_and_debug.w = 0.0;
+						//vattribs[vm2] = spring;
+						//makesubriver = false;
+					}
+					else if (optionGenerateDrainage == 1u)//if (e2.type != TYPE_DRAINAGE)
+					{
+						EM0.type = TYPE_DRAINAGE;
+						vertices[vm2].type = TYPE_DRAINAGE;
+						vattribs[vm2].misc1 = vec4(float(attribm2.position.w), 0.0, 0.0, 0.0);
+						
+						const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm2].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+						vattribs[vm0].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+					}
+				}
+				else if (optionGenerateDrainage == 1u && vattribs[v2].position.w > junction.position.w)
+				{
+					EM0.type = TYPE_DRAINAGE;
+					vertices[vm2].type = TYPE_DRAINAGE;
+					vattribs[vm2].misc1 = vec4(float(attribm2.position.w), 0.0, 0.0, 0.0);	
+					
+					const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm2].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+					vattribs[vm0].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+				}
+			}
+			//else if (/*e2.type != TYPE_DRAINAGE && */vattribs[v2].position.w > junction.position.w + 0.02LF)
+			//{
+				//EM0.type = TYPE_DRAINAGE;					
+			//}
+		}
+		/*else if (e0.type == TYPE_DRAINAGE && e2.type != TYPE_DRAINAGE && e2.type != TYPE_RIVER && vertices[vm2].type != TYPE_RIVER)
+		{			
+			seed(vertices[vm2].seed);
+			uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 );				
+			seed(vertices[vm0].seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 ); 				
+			if (i == aface && i == aface2)
+			{	
+				//vertices[vm2].type = TYPE_DRAINAGE;
+				EM0.type = TYPE_DRAINAGE;
+			}			
+		}	*/	
+	}
+	const int em0 = int(atomicCounterIncrement(edgeCounter));		
+	edges[em0] = EM0;
+	
+	Edge EM1;
+	EM1.v0 = vm0;
+	EM1.v1 = vm1;
+	EM1.vm = -1;
+	ghostv = (vertexm0.status == 1u || vertexm1.status == 1u) ? 1u:0;
+	EM1.status = ((lod + 1u) << 16) | (ghostv << 8);
+	EM1.child0 = -1;
+	EM1.child1 = -1;
+	EM1.f0 = t2;
+	EM1.f1 = t0;
+	EM1.type = TYPE_NONE;
+	if (ghostv == 0)
+	{// check if we can make a subriver:
+		if (e0.type == TYPE_RIVER && e1.type != TYPE_RIVER && e1.type != TYPE_DRAINAGE && attribm1.data.y != 0.0LF && vertexm1.type != TYPE_LAKE_SHORE && vertexm2.type != TYPE_LAKE_SHORE && vertices[v2].type != TYPE_LAKE_SHORE)
+		{
+			const VertexAttrib junction = attribm0;
+			//seed(vertexm1.seed);
+			//uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e1.f0 : e1.f1 );				
+			seed(vertexm0.seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 ); 
+			if (i == aface)// && i == aface2)
+			{					
+				if (checkRiverBranchingAngle(junction, attribm1.position.xyz) && attribm1.position.w > junction.position.w)// && junction.flow.w < 1.0)//vm1 is the new spring
+				{
+					river_proba = uint(100.0 * smoothstep(0.0, 0.5, junction.flow.w));
+					if ((rand_xorshift() % 128) > river_proba && makesubriver && junction.data.w != junction.position.w && junction.data.w > seaLevelKm + 0.2LF)//  && vertices[vm1].type != TYPE_RIDGE)
+					{
+						vertices[vm0].branch_count = 1u;
+						//vertices[vm1].type = TYPE_RIVER;
+						EM1.type = TYPE_RIVER;	
+						//VertexAttrib spring = attribm1;	
+						//const double edgelen = distance(junction.position.xyz, spring.position.xyz);
+						//const double max_spring_offset = min(1.5LF, max_slope * edgelen);
+						//double spring_altitude = min(vattribs[v2].position.w - 0.02LF, junction.position.w + double(0.05 + random()*0.95) * max_spring_offset); 						
+						//spring_altitude = max(spring_altitude, seaLevelKm + 0.004LF);						
+						//spring.position.xyz = normalize(spring.position.xyz) * (planetRadiusKm + spring_altitude);
+						//spring.position.w = spring_altitude;
+						//spring.data.x = spring_altitude;
+						//spring.data.y = 0.0LF;
+						//spring.data.w = spring_altitude;//make a spring (ie., water altitude = ground altitude)
+						//spring.flow = vec4(vec3(normalize(junction.position.xyz - spring.position.xyz)), springFlowValueDefault);
+						//vattribs[vm1].misc2.w = junction.misc2.w + 0.05*random();//river profile at spring : make it only a slight deviation from the profile at the junction, in order to avoid artefacts for short rivers.
+						//spring.padding_and_debug.w = 0.0;
+						//vattribs[vm1] = spring;
+						//makesubriver = false;
+					}
+					else if (optionGenerateDrainage == 1u)//if (e1.type != TYPE_DRAINAGE)
+					{
+						EM1.type = TYPE_DRAINAGE;
+						vertices[vm1].type = TYPE_DRAINAGE;
+						vattribs[vm1].misc1 = vec4(float(attribm1.position.w), 0.0, 0.0, 0.0);
+						
+						const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm1].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+						vattribs[vm0].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+					}
+				}
+				else if (optionGenerateDrainage == 1u && vattribs[v2].position.w > junction.position.w)
+				{
+					EM1.type = TYPE_DRAINAGE;
+					vertices[vm1].type = TYPE_DRAINAGE;
+					vattribs[vm1].misc1 = vec4(float(attribm1.position.w), 0.0, 0.0, 0.0);
+					
+					const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm1].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+					vattribs[vm0].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+				}
+			}
+			//else if (/*e1.type != TYPE_DRAINAGE && */vattribs[v2].position.w > junction.position.w + 0.02LF)
+			//{
+			//	EM1.type = TYPE_DRAINAGE;
+			//}
+		} 
+		/*else if (e0.type == TYPE_DRAINAGE && e1.type != TYPE_DRAINAGE && e1.type != TYPE_RIVER && vertices[vm1].type != TYPE_RIVER)
+		{			
+			seed(vertices[vm1].seed);
+			uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 );				
+			seed(vertices[vm0].seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 ); 				
+			if (i == aface && i == aface2)
+			{	
+			//	vertices[vm1].type = TYPE_DRAINAGE;
+				EM1.type = TYPE_DRAINAGE;
+			}			
+		}*/
+		else if (e0.type != TYPE_RIVER && e1.type == TYPE_RIVER && e0.type != TYPE_DRAINAGE && attribm0.data.y != 0.0LF && vertexm0.type != TYPE_LAKE_SHORE && vertexm2.type != TYPE_LAKE_SHORE && vertices[v0].type != TYPE_LAKE_SHORE)
+		{
+			const VertexAttrib junction = attribm1;
+			//seed(vertexm0.seed);
+			//uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 );				
+			seed(vertexm1.seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e1.f0 : e1.f1 ); 
+			if (i == aface)// && i == aface2)
+			{
+				if (checkRiverBranchingAngle(junction, vattribs[vm0].position.xyz) && attribm0.position.w > junction.position.w)// && junction.flow.w < 1.0)//vm0 is the new spring
+				{
+					river_proba = uint(100.0 * smoothstep(0.0, 0.5, junction.flow.w));
+					if ((rand_xorshift() % 128) > river_proba && makesubriver && junction.data.w != junction.position.w && junction.data.w > seaLevelKm + 0.2LF)// && vertices[vm0].type != TYPE_RIDGE)
+					{
+						vertices[vm1].branch_count = 1u;
+						//vertices[vm0].type = TYPE_RIVER;
+						EM1.type = TYPE_RIVER;									
+						//VertexAttrib spring = attribm0;							
+						//const double edgelen = distance(junction.position.xyz, spring.position.xyz);
+						//const double max_spring_offset = min(1.5LF, max_slope * edgelen);
+						//double spring_altitude = min(vattribs[v0].position.w - 0.02LF, junction.position.w + double(0.05 + random()*0.95) * max_spring_offset);
+						//spring_altitude = max(spring_altitude, seaLevelKm + 0.004LF);
+						//spring.position.xyz = normalize(spring.position.xyz) * (planetRadiusKm + spring_altitude);
+						//spring.position.w = spring_altitude;						
+						//spring.data.x = spring_altitude;
+						//spring.data.y = 0.0LF;
+						//spring.data.w = spring_altitude;//make a spring (ie., water altitude = ground altitude)
+						//spring.flow = vec4(vec3(normalize(junction.position.xyz - spring.position.xyz)), springFlowValueDefault);
+						//vattribs[vm0].misc2.w = junction.misc2.w + 0.05*random();//river profile at spring : make it only a slight deviation from the profile at the junction, in order to avoid artefacts for short rivers.
+						//spring.padding_and_debug.w = 0.0;
+						//vattribs[vm0] = spring;
+						//makesubriver = false;
+					}
+					else if (optionGenerateDrainage == 1u)//if (e0.type != TYPE_DRAINAGE)
+					{
+						EM1.type = TYPE_DRAINAGE;
+						vertices[vm0].type = TYPE_DRAINAGE;
+						vattribs[vm0].misc1 = vec4(float(attribm0.position.w), 0.0, 0.0, 0.0);
+						
+						const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm0].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+						vattribs[vm1].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+					}
+				}
+				else if (optionGenerateDrainage == 1u && vattribs[v0].position.w > junction.position.w)
+				{
+					EM1.type = TYPE_DRAINAGE;
+					vertices[vm0].type = TYPE_DRAINAGE;
+					vattribs[vm0].misc1 = vec4(float(attribm0.position.w), 0.0, 0.0, 0.0);
+					
+					const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm0].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+					vattribs[vm1].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+				}
+			}	
+			//else if (/*e0.type != TYPE_DRAINAGE && */vattribs[v0].position.w > junction.position.w + 0.02LF)
+			//{
+			//	EM1.type = TYPE_DRAINAGE;
+			//}
+		}
+		/*else if (e1.type == TYPE_DRAINAGE && e0.type != TYPE_DRAINAGE && e0.type != TYPE_RIVER && vertices[vm0].type != TYPE_RIVER)
+		{			
+			seed(vertices[vm0].seed);
+			uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 );				
+			seed(vertices[vm1].seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 ); 				
+			if (i == aface && i == aface2)
+			{	
+				//vertices[vm0].type = TYPE_DRAINAGE;
+				EM1.type = TYPE_DRAINAGE;
+			}			
+		}*/
+	}
+	const int em1 = int(atomicCounterIncrement(edgeCounter));		
+	edges[em1] = EM1;
+	
+	Edge EM2;
+	EM2.v0 = vm1;
+	EM2.v1 = vm2;
+	EM2.vm = -1;
+	ghostv = (vertexm1.status == 1u || vertexm2.status == 1u) ? 1u:0;
+	EM2.status = ((lod + 1u) << 16) | (ghostv << 8);
+	EM2.child0 = -1;
+	EM2.child1 = -1;
+	EM2.f0 = t3;
+	EM2.f1 = t0;
+	EM2.type = TYPE_NONE;
+	if (ghostv == 0)
+	{// check if we can make a subriver:
+		if (e1.type == TYPE_RIVER && e2.type != TYPE_RIVER && e2.type != TYPE_DRAINAGE && attribm2.data.y != 0.0LF && vertexm2.type != TYPE_LAKE_SHORE && vertexm0.type != TYPE_LAKE_SHORE && vertices[v0].type != TYPE_LAKE_SHORE)
+		{
+			const VertexAttrib junction = attribm1;
+			//seed(vertexm2.seed);
+			//uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 );				
+			seed(vertexm1.seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e1.f0 : e1.f1 ); 
+			if (i == aface)// && i == aface2)
+			{								
+				if (checkRiverBranchingAngle(junction, attribm2.position.xyz) && attribm2.position.w > junction.position.w)// && junction.flow.w < 1.0)//vm2 is the new spring
+				{
+					river_proba = uint(100.0 * smoothstep(0.0, 0.5, junction.flow.w));
+					if ((rand_xorshift() % 128) > river_proba && makesubriver && junction.data.w != junction.position.w && junction.data.w > seaLevelKm + 0.2LF)// && vertices[vm2].type != TYPE_RIDGE)
+					{
+						vertices[vm1].branch_count = 1u;
+						//vertices[vm2].type = TYPE_RIVER;
+						EM2.type = TYPE_RIVER;			
+						//VertexAttrib spring = attribm2;
+						//const double edgelen = distance(junction.position.xyz, spring.position.xyz);
+						//const double max_spring_offset = min(1.5LF, max_slope * edgelen);
+						//double spring_altitude = min(vattribs[v0].position.w - 0.02LF, junction.position.w + double(0.05 + random()*0.95) * max_spring_offset);
+						//spring_altitude = max(spring_altitude, seaLevelKm + 0.004LF);
+						//spring.position.xyz = normalize(spring.position.xyz) * (planetRadiusKm + spring_altitude);
+						//spring.position.w = spring_altitude;
+						//spring.data.x = spring_altitude;
+						//spring.data.y = 0.0LF;
+						//spring.data.w = spring_altitude;//make a spring (ie., water altitude = ground altitude)
+						//spring.flow = vec4(vec3(normalize(junction.position.xyz - spring.position.xyz)), springFlowValueDefault);
+						//vattribs[vm2].misc2.w = junction.misc2.w + 0.05*random();//river profile at spring : make it only a slight deviation from the profile at the junction, in order to avoid artefacts for short rivers.
+						//spring.padding_and_debug.w = 0.0;
+						//vattribs[vm2] = spring;
+						//makesubriver = false;
+					}
+					else if (optionGenerateDrainage == 1u)//if (e2.type != TYPE_DRAINAGE)
+					{
+						EM2.type = TYPE_DRAINAGE;
+						vertices[vm2].type = TYPE_DRAINAGE;
+						vattribs[vm2].misc1 = vec4(float(attribm2.position.w), 0.0, 0.0, 0.0);
+						
+						const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm2].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+						vattribs[vm1].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+					}
+				}
+				else if (optionGenerateDrainage == 1u && vattribs[v0].position.w > junction.position.w)
+				{
+					EM2.type = TYPE_DRAINAGE;
+					vertices[vm2].type = TYPE_DRAINAGE;
+					vattribs[vm2].misc1 = vec4(float(attribm2.position.w), 0.0, 0.0, 0.0);
+					
+					const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm2].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+					vattribs[vm1].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+				}
+			}	
+			//else if (/*e2.type != TYPE_DRAINAGE && */vattribs[v0].position.w > junction.position.w + 0.02LF)
+			//{
+			//	EM2.type = TYPE_DRAINAGE;
+			//}			
+		} 
+		/*else if (e1.type == TYPE_DRAINAGE && e2.type != TYPE_DRAINAGE && e2.type != TYPE_RIVER && vertices[vm2].type != TYPE_RIVER)
+		{			
+			seed(vertices[vm2].seed);
+			uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 );				
+			seed(vertices[vm1].seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 ); 				
+			if (i == aface && i == aface2)
+			{	
+				//vertices[vm2].type = TYPE_DRAINAGE;
+				EM2.type = TYPE_DRAINAGE;
+			}
+		}*/
+		else if (e1.type != TYPE_RIVER && e2.type == TYPE_RIVER && e1.type != TYPE_DRAINAGE && attribm1.data.y != 0.0LF && vertexm1.type != TYPE_LAKE_SHORE && vertexm0.type != TYPE_LAKE_SHORE)// && vertices[v1].type != TYPE_LAKE_SHORE) // && vertices[vm1].type != TYPE_DRAINAGE) this commented predicate cannot be checked because things can change on vm1 (parallelism issue)
+		{
+			const VertexAttrib junction = attribm2;
+			//seed(vertexm1.seed);
+			//uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e1.f0 : e1.f1 );				
+			seed(vertexm2.seed);
+			uint aface = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 ); 
+			//note: this way of ensuring good parallelism is secure and cheap computation wise (a lot cheaper than using atomic operations that, besides, do prevent race conditions but do not garantee determinism (first come first serve => change) !)
+			//, but leads to sparse river branching (1 over 4 on average).
+			if (i == aface)// && i == aface2)
+			{								
+				if (checkRiverBranchingAngle(junction, attribm1.position.xyz) && attribm1.position.w > junction.position.w)// && junction.flow.w < 1.0)//vm1 is the new spring
+				{
+					river_proba = uint(100.0 * smoothstep(0.0, 0.5, junction.flow.w));
+					if ((rand_xorshift() % 128) > river_proba  && makesubriver && junction.data.w != junction.position.w && junction.data.w > seaLevelKm + 0.2LF)// && vertices[vm1].type != TYPE_RIDGE)
+					{
+						vertices[vm2].branch_count = 1u;
+						//vertices[vm1].type = TYPE_RIVER;
+						EM2.type = TYPE_RIVER;
+						//VertexAttrib spring = attribm1;						
+						//const double edgelen = distance(junction.position.xyz, spring.position.xyz);
+						//const double max_spring_offset = min(1.5LF, max_slope * edgelen);
+						//double spring_altitude = min(vattribs[v1].position.w - 0.02LF, junction.position.w + double(0.05 + random()*0.95) * max_spring_offset);						
+						//spring_altitude = max(spring_altitude, seaLevelKm + 0.004LF);
+						//spring.position.xyz = normalize(spring.position.xyz) * (planetRadiusKm + spring_altitude);
+						//spring.position.w = spring_altitude;
+						//spring.data.x = spring_altitude;
+						//spring.data.y = 0.0LF;
+						//spring.data.w = spring_altitude;//make a spring (ie., water altitude = ground altitude)
+						//spring.flow = vec4(vec3(normalize(junction.position.xyz - spring.position.xyz)), springFlowValueDefault);
+						//vattribs[vm1].misc2.w = junction.misc2.w + 0.05*random();//river profile at spring : make it only a slight deviation from the profile at the junction, in order to avoid artefacts for short rivers.
+						//spring.padding_and_debug.w = 0.0;
+						//vattribs[vm1] = spring;
+						//makesubriver = false;
+					}
+					else if (optionGenerateDrainage == 1u)
+					{
+						EM2.type= TYPE_DRAINAGE;
+						vertices[vm1].type = TYPE_DRAINAGE;
+						vattribs[vm1].misc1 = vec4(float(attribm1.position.w), 0.0, 0.0, 0.0);
+						
+						const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm1].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+						vattribs[vm2].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+					}
+				}
+				else if (optionGenerateDrainage == 1u && vattribs[v1].position.w > junction.position.w)
+				{
+					EM2.type = TYPE_DRAINAGE;
+					vertices[vm1].type = TYPE_DRAINAGE;
+					vattribs[vm1].misc1 = vec4(float(attribm1.position.w), 0.0, 0.0, 0.0);
+					
+					const float ravinflow = 0.0;//float(distance(junction.position.xyz, vattribs[vm1].position.xyz)) / 25.0; //25 is a normalization constant corresponding to 25 km.... better use a uniform.
+					vattribs[vm2].misc1 = vec4(float(junction.position.w), 0.0, 0.0, ravinflow);
+				}
+			}
+			//else if (/*e1.type != TYPE_DRAINAGE && */vattribs[v1].position.w > junction.position.w + 0.02LF)
+			//{
+			//	EM2.type = TYPE_DRAINAGE;
+			//}		
+		}
+		/*else if (e2.type == TYPE_DRAINAGE && e1.type != TYPE_DRAINAGE && e1.type != TYPE_RIVER && vertices[vm1].type != TYPE_RIVER)
+		{			
+			//const VertexAttrib junction = vattribs[vm2];
+			//if (checkRiverBranchingAngle(junction, vattribs[vm1].position.xyz))
+			//{
+				seed(vertices[vm1].seed);
+				uint aface2 = uint( (rand_xorshift() % 128) > 64 ? e0.f0 : e0.f1 );				
+				seed(vertices[vm2].seed);
+				uint aface = uint( (rand_xorshift() % 128) > 64 ? e2.f0 : e2.f1 ); 				
+				if (i == aface && i == aface2)
+				{	
+					//vertices[vm1].type = TYPE_DRAINAGE;
+					EM2.type = TYPE_DRAINAGE;
+				}
+			//}
+		}*/
+	}
+	const int em2 = int(atomicCounterIncrement(edgeCounter));		
+	edges[em2] = EM2;
+	
+	// --- Create 4 subtriangles (starting with the middle triangle) ---
+	Face T;
+	T.e0 = em0;
+	T.e1 = em1;
+	T.e2 = em2;
+	T.status = (faceLOD + 1u) << 8;	
+	//dvec3 p01 = (vattribs[vm1].position - vattribs[vm0].position).xyz;
+	//dvec3 p02 = (vattribs[vm2].position - vattribs[vm0].position).xyz;
+	//dvec3 n = normalize(cross(p01/renderScale, p02/renderScale));
+	//T.normal_x = float(n.x);
+	//T.normal_y = float(n.y);
+	//T.normal_z = float(n.z);
+	faces[t0] = T;
+	
+	int e00, e01;//determine winding order of subedges
+	if (edges[e0.child0].v0 == v0 || edges[e0.child0].v1 == v0)
+	{
+		e00 = e0.child0;
+		e01 = e0.child1;
+	}
+	else {
+		e00 = e0.child1;
+		e01 = e0.child0;
+	}
+	int e10, e11;
+	if (edges[e1.child0].v0 == v1 || edges[e1.child0].v1 == v1)
+	{
+		e10 = e1.child0;
+		e11 = e1.child1;
+	}
+	else {
+		e10 = e1.child1;
+		e11 = e1.child0;
+	}
+	int e20, e21;
+	if (edges[e2.child0].v0 == v2 || edges[e2.child0].v1 == v2)
+	{
+		e20 = e2.child0;
+		e21 = e2.child1;
+	}
+	else {
+		e20 = e2.child1;
+		e21 = e2.child0;
+	}
+	
+	
+	// -The commented section below regularizes lakes surfaces (set all involved vertices to the same water height) -		
+	// this has improved since inception since it originally caused unwanted river disappearance in some cases,
+	//			when the river water upstream was shallow (since the water gets lowered).
+	//			The fix was to add ground elevation (river bed) adjustment, so that the shallow rivers don't disappear.	
+	//	There is still a determinism issue here that is not handled, if two adjacent lakes coexist 
+	//  (cause by two threads updating concurrently the same data) -  this is the main reason why the section is now commented.
+	// -- Try and Fixme (hint: add locking mechanism, using extra data or search among neighboring triangles) --
+	//	Removing this planarity code section causes on the other hand,
+	//			defects on some lake portions if a nearby water stream influences the global water elevation.
+	/*if (vertexm0.type == TYPE_LAKE_SHORE)
+	{
+		const double w = attribm0.data.w;
+		if (e1.type == TYPE_RIVER && (v1 == vertexm0.prim2 || v2 == vertexm0.prim2))
+		{
+			VertexAttrib v1a = vattribs[v1];
+			VertexAttrib v2a = vattribs[v2];
+			double riverbed_elevation_offset = 0.0LF;
+			if (w < v1a.data.w || w < v2a.data.w)
+				riverbed_elevation_offset = max(v1a.data.w - w, v2a.data.w -w);
+			
+			v1a.position.w -= riverbed_elevation_offset;//lower riverbed to compensate
+			attribm1.position.w -= riverbed_elevation_offset;
+			v2a.position.w -= riverbed_elevation_offset;
+			
+			v1a.data.x -= riverbed_elevation_offset;
+			attribm1.data.x -= riverbed_elevation_offset;
+			v2a.data.x -= riverbed_elevation_offset;
+			
+			v1a.data.w = w;//set planar water elevation across the boundaries of the lake
+			attribm1.data.w = w;
+			v2a.data.w = w;
+			
+			vattribs[v1] = v1a;
+			vattribs[vm1] = attribm1;
+			vattribs[v2] = v2a;
+		} 
+		else if (e2.type == TYPE_RIVER && (v0 == vertexm0.prim2 || v2 == vertexm0.prim2))
+		{			
+			VertexAttrib v0a = vattribs[v0];
+			VertexAttrib v2a = vattribs[v2];
+			double riverbed_elevation_offset = 0.0LF;
+			if (w < v0a.data.w || w < v2a.data.w)
+				riverbed_elevation_offset = max(v0a.data.w - w, v2a.data.w - w);
+			
+			v0a.position.w -= riverbed_elevation_offset;//lower riverbed to compensate
+			attribm2.position.w -= riverbed_elevation_offset;
+			v2a.position.w -= riverbed_elevation_offset;
+			
+			v0a.data.x -= riverbed_elevation_offset;
+			attribm2.data.x -= riverbed_elevation_offset;
+			v2a.data.x -= riverbed_elevation_offset;
+			
+			v0a.data.w = w;//set planar water elevation across the boundaries of the lake
+			attribm2.data.w = w;
+			v2a.data.w = w;
+			
+			vattribs[v0] = v0a;
+			vattribs[vm2] = attribm2;
+			vattribs[v2] = v2a;			
+		}
+	}
+	else if (vertexm1.type == TYPE_LAKE_SHORE)
+	{
+		const double w = attribm1.data.w;
+		if (e0.type == TYPE_RIVER  && (v0 == vertexm1.prim2 || v1 == vertexm1.prim2))
+		{			
+			VertexAttrib v0a = vattribs[v0];
+			VertexAttrib v1a = vattribs[v1];
+			double riverbed_elevation_offset = 0.0LF;
+			if (w < v0a.data.w || w < v1a.data.w)
+				riverbed_elevation_offset = max(v0a.data.w - w, v1a.data.w - w);
+			
+			v0a.position.w -= riverbed_elevation_offset;//lower riverbed to compensate
+			attribm0.position.w -= riverbed_elevation_offset;
+			v1a.position.w -= riverbed_elevation_offset;
+			
+			v0a.data.x -= riverbed_elevation_offset;
+			attribm0.data.x -= riverbed_elevation_offset;
+			v1a.data.x -= riverbed_elevation_offset;
+			
+			v0a.data.w = w;//set planar water elevation across the boundaries of the lake
+			attribm0.data.w = w;
+			v1a.data.w = w;
+			
+			vattribs[v0] = v0a;
+			vattribs[vm0] = attribm0;
+			vattribs[v1] = v1a;			
+		}
+		else if (e2.type == TYPE_RIVER && (v0 == vertexm1.prim2 || v2 == vertexm1.prim2))
+		{
+			VertexAttrib v0a = vattribs[v0];
+			VertexAttrib v2a = vattribs[v2];
+			double riverbed_elevation_offset = 0.0LF;
+			if (w < v0a.data.w || w < v2a.data.w)
+				riverbed_elevation_offset = max(v0a.data.w - w, v2a.data.w - w);
+			
+			v0a.position.w -= riverbed_elevation_offset;//lower riverbed to compensate
+			attribm2.position.w -= riverbed_elevation_offset;
+			v2a.position.w -= riverbed_elevation_offset;
+			
+			v0a.data.x -= riverbed_elevation_offset;
+			attribm2.data.x -= riverbed_elevation_offset;
+			v2a.data.x -= riverbed_elevation_offset;
+			
+			v0a.data.w = w;//set planar water elevation across the boundaries of the lake
+			attribm2.data.w = w;
+			v2a.data.w = w;
+			
+			vattribs[v0] = v0a;
+			vattribs[vm2] = attribm2;
+			vattribs[v2] = v2a;			
+		}
+	}
+	else if (vertexm2.type == TYPE_LAKE_SHORE)
+	{
+		const double w = attribm2.data.w;
+		if (e0.type == TYPE_RIVER && (v0 == vertexm2.prim2 || v1 == vertexm2.prim2))
+		{			
+			VertexAttrib v0a = vattribs[v0];
+			VertexAttrib v1a = vattribs[v1];
+			double riverbed_elevation_offset = 0.0LF;
+			if (w < v0a.data.w || w < v1a.data.w)
+				riverbed_elevation_offset = max(v0a.data.w - w, v1a.data.w - w);
+			
+			v0a.position.w -= riverbed_elevation_offset;//lower riverbed to compensate
+			attribm0.position.w -= riverbed_elevation_offset;
+			v1a.position.w -= riverbed_elevation_offset;
+			
+			v0a.data.x -= riverbed_elevation_offset;
+			attribm0.data.x -= riverbed_elevation_offset;
+			v1a.data.x -= riverbed_elevation_offset;
+			
+			v0a.data.w = w;//set planar water elevation across the boundaries of the lake
+			attribm0.data.w = w;
+			v1a.data.w = w;
+			
+			vattribs[v0] = v0a;
+			vattribs[vm0] = attribm0;
+			vattribs[v1] = v1a;			
+		}
+		else if (e1.type == TYPE_RIVER && (v1 == vertexm2.prim2 || v2 == vertexm2.prim2))
+		{
+			VertexAttrib v1a = vattribs[v1];
+			VertexAttrib v2a = vattribs[v2];
+			double riverbed_elevation_offset = 0.0LF;
+			if (w < v1a.data.w || w < v2a.data.w)
+				riverbed_elevation_offset = max(v1a.data.w - w, v2a.data.w - w);
+			
+			v1a.position.w -= riverbed_elevation_offset;//lower riverbed to compensate
+			attribm1.position.w -= riverbed_elevation_offset;
+			v2a.position.w -= riverbed_elevation_offset;
+			
+			v1a.data.x -= riverbed_elevation_offset;
+			attribm1.data.x -= riverbed_elevation_offset;
+			v2a.data.x -= riverbed_elevation_offset;
+			
+			v1a.data.w = w;//set planar water elevation across the boundaries of the lake
+			attribm1.data.w = w;
+			v2a.data.w = w;
+			
+			vattribs[v1] = v1a;
+			vattribs[vm1] = attribm1;
+			vattribs[v2] = v2a;
+		}
+	}*/
+	
+	
+	
+	// Ensure proper type on Springs (since it can be overriden by drainage):
+	// This gets rid of unwanted lakes caused by deficient vertex modification (assigning new type TYPE_RIVER on springs), even when lakes are turned off.
+	/*if (EM0.type == TYPE_RIVER)
+	{
+		vertices[vm2].type = TYPE_RIVER;
+		vertices[vm0].type = TYPE_RIVER;		
+	}
+	if (EM1.type == TYPE_RIVER)
+	{
+		vertices[vm0].type = TYPE_RIVER;
+		vertices[vm1].type = TYPE_RIVER;
+	}
+	if (EM2.type == TYPE_RIVER)
+	{
+		vertices[vm1].type = TYPE_RIVER;
+		vertices[vm2].type = TYPE_RIVER;
+	}*/
+	
+	
+
+	T.e0 = e00;
+	T.e1 = em0;
+	T.e2 = e21;
+	T.status = (faceLOD + 1u) << 8;	
+	//p01 = (vattribs[vm0].position - vattribs[v0].position).xyz;
+	//p02 = (vattribs[vm2].position - vattribs[v0].position).xyz;
+	//n = normalize(cross(p01/renderScale, p02/renderScale));
+	//T.normal_x = float(n.x);
+	//T.normal_y = float(n.y);
+	//T.normal_z = float(n.z);
+	faces[t1] = T;
+		
+	T.e0 = e10;
+	T.e1 = em1;
+	T.e2 = e01;
+	T.status = (faceLOD + 1u) << 8;	
+	//p01 = (vattribs[vm1].position - vattribs[v1].position).xyz;
+	//p02 = (vattribs[vm0].position - vattribs[v1].position).xyz;
+	//n = normalize(cross(p01/renderScale, p02/renderScale));
+	//T.normal_x = float(n.x);
+	//T.normal_y = float(n.y);
+	//T.normal_z = float(n.z);
+	faces[t2] = T;
+	
+	T.e0 = e20;
+	T.e1 = em2;
+	T.e2 = e11;
+	T.status = (faceLOD + 1u) << 8;	
+	//p01 = (vattribs[vm2].position - vattribs[v2].position).xyz;
+	//p02 = (vattribs[vm1].position - vattribs[v2].position).xyz;
+	//n = normalize(cross(p01/renderScale, p02/renderScale));
+	//T.normal_x = float(n.x);
+	//T.normal_y = float(n.y);
+	//T.normal_z = float(n.z);
+	faces[t3] = T;
+	
+	// edge adjacency update
+	const int oldface = int(i);
+	if (edges[e00].f0 == oldface)
+		edges[e00].f0 = t1;
+	else edges[e00].f1 = t1;
+
+	if (edges[e01].f0 == oldface)
+		edges[e01].f0 = t2;
+	else edges[e01].f1 = t2;
+
+	if (edges[e10].f0 == oldface)
+		edges[e10].f0 = t2;
+	else edges[e10].f1 = t2;
+
+	if (edges[e11].f0 == oldface)
+		edges[e11].f0 = t3;
+	else edges[e11].f1 = t3;
+
+	if (edges[e20].f0 == oldface)
+		edges[e20].f0 = t3;
+	else edges[e20].f1 = t3;
+
+	if (edges[e21].f0 == oldface)
+		edges[e21].f0 = t1;
+	else edges[e21].f1 = t1;
+
+	// vertex adjacency update	
+	updateVertexAdjacency(v0, oldface, t1);//corner vertices
+	updateVertexAdjacency(v1, oldface, t2);
+	updateVertexAdjacency(v2, oldface, t3);
+	if (vertices[vm0].faces_0[0] == oldface)// middle vertices
+	{
+		vertices[vm0].faces_0[0] = t1;
+		vertices[vm0].faces_0[1] = t0;
+		vertices[vm0].faces_0[2] = t2;
+	}
+	else {
+		vertices[vm0].faces_1[0] = t1;
+		vertices[vm0].faces_1[1] = t0;
+		vertices[vm0].faces_1[2] = t2;
+	}
+	if (vertices[vm1].faces_0[0] == oldface)
+	{
+		vertices[vm1].faces_0[0] = t2;
+		vertices[vm1].faces_0[1] = t0;
+		vertices[vm1].faces_0[2] = t3;
+	}
+	else {
+		vertices[vm1].faces_1[0] = t2;
+		vertices[vm1].faces_1[1] = t0;
+		vertices[vm1].faces_1[2] = t3;
+	}
+	if (vertices[vm2].faces_0[0] == oldface)
+	{
+		vertices[vm2].faces_0[0] = t3;
+		vertices[vm2].faces_0[1] = t0;
+		vertices[vm2].faces_0[2] = t1;
+	}
+	else {
+		vertices[vm2].faces_1[0] = t3;
+		vertices[vm2].faces_1[1] = t0;
+		vertices[vm2].faces_1[2] = t1;
+	}
+}

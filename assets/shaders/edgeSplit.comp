@@ -1,0 +1,1068 @@
+#version 450
+//#pragma optionNV(fastmath off)
+//#pragma optionNV(fastprecision off)
+
+// --- structures de données ---
+#define TYPE_NONE							0	
+#define TYPE_SEA							1		
+#define TYPE_CONTINENT						2
+#define TYPE_RIVER							3
+#define TYPE_COAST							4
+#define TYPE_RIDGE							5
+#define TYPE_DRAINAGE						6
+#define TYPE_LAKE							7
+#define TYPE_LAKE_SHORE						8
+#define TYPE_OCTAHEDRON_EDGE				16
+		
+const float springFlowValueDefault = 0.0;// base rivers get 0.01 for this value, but resulting terrain is ugly if we assign the same
+
+#define ENABLE_CLOD							false//experimental and ineffective... so off.
+		
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Vertex
+{
+	/// first list of indexes of incident faces (or -1 if none)
+	int faces_0[4];
+	/// second list of indexes of incident faces (or -1 if none)
+	int faces_1[4];
+	/// PRNG seed
+	uint seed;
+	/// boolean = ghost or not ghost vertex
+	uint status;
+	//
+	uint type;
+	///
+	uint branch_count; 
+	
+	/// some references (prim0 is used as a containing triangle index, for water animation ; prim1 is unused ; prim2 is a vertex reference used for lakes]
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;		
+	//int pad[4];
+};
+struct Face
+{
+	/// indexes of the three edges.
+	int e0, e1, e2;
+	/// normal to the triangle
+	float normal_x, normal_y, normal_z;
+	/// LSB to MSB : byte 0 = boolean (split 1 or not 0), byte 2 = lod
+	uint status;
+	//
+	uint type;
+};
+struct VertexAttrib
+{
+	/// xyz = world position (km), w = elevation (km)
+	dvec4 position;
+	/// x = nearest river elevation, y = distance to nearest river, z = tectonic elevation, w = water elevation
+	dvec4 data;
+	/// xyz = normalized flow direction, w = flow value (normalized)
+	vec4 flow;
+	/// x = nearest ravin elevation, y = distance to nearest ravin, z = hills, w = ravin flow value (unused)
+	vec4 misc1;
+	/// x = crust age in Ma, y = plateau presence in [0, 1], z: desert presence (test: volcanic presence (lod 0)/ distance2volcano (lod >0)), w = river profile indirection
+	vec4 misc2;
+	/// (test) z = nearestVolcanoElevation
+	vec4 padding_and_debug;
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) coherent buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 1, std430) coherent buffer vertices_buffer 
+{
+  Vertex vertices[];
+};
+layout(binding = 2, std430) readonly buffer faces_buffer 
+{
+  Face faces[];
+};
+layout(binding = 3, std430) coherent buffer vattribs_buffer 
+{
+  VertexAttrib vattribs[];
+};
+
+// --- atomic counters ---
+layout (binding = 5, offset = 0) uniform atomic_uint edgeCounter;
+layout (binding = 6, offset = 0) uniform atomic_uint vertexCounter;
+layout (binding = 7, offset = 0) uniform atomic_uint faceCounter;
+
+// --- uniforms ---
+uniform dvec3 cameraPositionKm;
+uniform double cameraNearPlaneKm;
+uniform float cameraVerticalFOV;
+uniform double screenHeightPixels;
+uniform double edgeLengthPixels_criterion;
+
+uniform double planetRadiusKm;
+uniform float seaLevelKm;
+
+uniform uint optionGenerateDrainage;
+uniform uint optionGenerateLakes;
+
+uniform uint baseEdgeIndex;
+uniform uint lastEdgeIndex;
+
+
+// --- constants ---
+const double screenHeightWorldUnits = 2.0LF * cameraNearPlaneKm * double(tan(cameraVerticalFOV*0.5 * 3.141592653 / 180.0));
+
+// --- utility functions ---
+
+// UNUSED -- get a tangent frame from a normalized vector
+void getTangentFrame(dvec3 N, out dvec3 T, out dvec3 B)
+{
+	const double a = 1.0LF / (1.0LF + N.z);
+	const double d = -N.x * N.y * a;
+	T = dvec3(1.0LF - N.x * N.x * a, d, -N.x);
+	B = dvec3(d, 1.0LF - N.y * N.y * a, -N.y);
+	
+	const double condition = step(-0.99999LF, N.z);
+	T = mix(dvec3(0.0LF, -1.0LF, 0.0LF), T, condition);
+	B = mix(dvec3(-1.0LF, 0.0LF, 0.0LF), B, condition);
+}
+
+// see http://www.reedbeta.com/blog/quick-and-easy-gpu-random-numbers-in-d3d11/	
+// for a good overview of PRNG on GPU (things like LCG vs Hashing)
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+uint rn_state;
+uint rand_xorshift()
+{
+    // Xorshift algorithm from George Marsaglia's paper
+    rn_state ^= (rn_state << 13);
+    rn_state ^= (rn_state >> 17);
+    rn_state ^= (rn_state << 5);
+    return rn_state;
+}
+void seed(uint s)
+{
+	rn_state = wang_hash(s);
+}
+
+float random()
+{
+	return float(rand_xorshift()) * (1.0 / 4294967296.0);
+}
+
+bool needEdgeSplit(double dist, double len, out double clod)
+{
+	double projlen = len * cameraNearPlaneKm / dist;
+	projlen *= screenHeightPixels / screenHeightWorldUnits;
+	
+	// continuous lod factor:
+	clod = smoothstep(0.0LF, 1.0LF, 0.75LF * (projlen - edgeLengthPixels_criterion) / edgeLengthPixels_criterion);
+	
+	return projlen > edgeLengthPixels_criterion;
+}
+
+void getSurroundingVertices(int edge_index, const Edge edge, out int va, out int vb)
+{
+	Face F = faces[edge.f0];
+	if (edge_index == F.e0)
+	{
+		const Edge E0 = edges[F.e2];
+		const Edge E1 = edges[F.e1];
+		if (E0.v0 == E1.v0 || E0.v0 == E1.v1)
+			va = E0.v0;
+		else va = E0.v1;
+	}
+	else if (edge_index == F.e1)
+	{
+		const Edge E0 = edges[F.e0];
+		const Edge E1 = edges[F.e2];
+		if (E0.v0 == E1.v0 || E0.v0 == E1.v1)
+			va = E0.v0;
+		else va = E0.v1;
+	}
+	else {
+		const Edge E0 = edges[F.e1];
+		const Edge E1 = edges[F.e0];
+		if (E0.v0 == E1.v0 || E0.v0 == E1.v1)
+			va = E0.v0;
+		else va = E0.v1;
+	}
+	
+	F = faces[edge.f1];
+	if (edge_index == F.e0)
+	{
+		const Edge E0 = edges[F.e2];
+		const Edge E1 = edges[F.e1];
+		if (E0.v0 == E1.v0 || E0.v0 == E1.v1)
+			vb = E0.v0;
+		else vb = E0.v1;
+	}
+	else if (edge_index == F.e1)
+	{
+		const Edge E0 = edges[F.e0];
+		const Edge E1 = edges[F.e2];
+		if (E0.v0 == E1.v0 || E0.v0 == E1.v1)
+			vb = E0.v0;
+		else vb = E0.v1;
+	}
+	else {
+		const Edge E0 = edges[F.e1];
+		const Edge E1 = edges[F.e0];
+		if (E0.v0 == E1.v0 || E0.v0 == E1.v1)
+			vb = E0.v0;
+		else vb = E0.v1;
+	}	
+}
+
+dvec3 applyHorizontalDisplacement(dvec3 p0, dvec3 p1, Edge E, int index)
+{
+	//barycentric displacement ensures new position lies within the neighboring triangle' safe zone:
+	
+	double r = double(0.33 + 0.33*random());	
+	dvec3 p = mix(p0, p1, r);
+	//double rx = double((1.0 - 0.9*smoothstep(0.0, 12.0, lodf)) * 0.33 * random());
+	
+	double s = double(0.33 + 0.33*random());
+	int va, vb;
+	getSurroundingVertices(index, E, va, vb);	
+	int vx = va;
+	if (random() < 0.5)
+		vx = vb;
+	dvec4 px = vattribs[vx].position;
+	return mix(p, 0.33333333LF * (p0 + p1 + px.xyz), s);
+}
+
+Edge getAdjacentRiverEdge(const Edge current_edge)
+{// note : this algorithm is wrongo, there are cases when 2 river edges can be found adjacent to the target edge !
+	const Face F0 = faces[current_edge.f0];
+	const Edge f0_e0 = edges[F0.e0];
+	if (f0_e0.type == TYPE_RIVER)
+		return f0_e0;
+	const Edge f0_e1 = edges[F0.e1];
+	if (f0_e1.type == TYPE_RIVER)
+		return f0_e1;
+	const Edge f0_e2 = edges[F0.e2];
+	if (f0_e2.type == TYPE_RIVER)
+		return f0_e2;
+	
+	const Face F1 = faces[current_edge.f1];
+	const Edge f1_e0 = edges[F1.e0];
+	if (f1_e0.type == TYPE_RIVER)
+		return f1_e0;
+	const Edge f1_e1 = edges[F1.e1];
+	if (f1_e1.type == TYPE_RIVER)
+		return f1_e1;
+	const Edge f1_e2 = edges[F1.e2];
+	return f1_e2;
+}
+
+
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint i = gl_GlobalInvocationID.x  +  baseEdgeIndex;
+	if (i > lastEdgeIndex)
+		return;
+
+	const Edge E = edges[i];
+	if ((E.status & 255u) != 0u)
+		return;
+	
+	// check if the edge needs be split according to target edge screen size:
+	const uint lod = E.status >> 16;
+	const float lodf = clamp(float(lod) - 8.0, 0.0, 24.0);
+	const int v0 = E.v0;
+	const int v1 = E.v1;
+	const Vertex vertex0 = vertices[v0];
+	const Vertex vertex1 = vertices[v1];
+	const VertexAttrib attrib0 = vattribs[v0];
+	const VertexAttrib attrib1 = vattribs[v1];
+	const dvec4 p0 = attrib0.position;
+	const dvec4 p1 = attrib1.position;
+	
+	//const double dist = min(distance(cameraPositionKm, p0.xyz), distance(cameraPositionKm, p1.xyz));	
+	//const double edgelen_d = distance(p0.xyz, p1.xyz);
+	//double theoretical_edgelen = 50.0LF / double(pow(2.0, lodf)); // TODO : inject a uniform instead of using the 50km constant.
+		
+	//(More accurate rule taking into account view angle on triangle)
+	const dvec3 edgevec = p1.xyz - p0.xyz;
+	const double edgelen_d = length(edgevec);
+	const dvec3 cam2p0 = p0.xyz - cameraPositionKm;
+	const double len_cp0 = length(cam2p0);
+	const dvec3 cam2p1 = p1.xyz - cameraPositionKm;
+	const double len_cp1 = length(cam2p1);
+		
+	double projected_edgelen, dist2nearest;
+	bool beyondHorizon;
+	dvec3 cam2p;
+	if (len_cp1 < len_cp0)
+	{
+		dist2nearest = len_cp1;
+		const double cosangle = abs(dot(cam2p0 / len_cp0, -normalize(edgevec)));
+		projected_edgelen = edgelen_d * (0.25LF + 0.75LF * sqrt(1.0LF - cosangle * cosangle));				
+		const dvec3 radiusvec = normalize(p1.xyz);
+		beyondHorizon = dist2nearest > 400.0LF;
+		beyondHorizon = beyondHorizon && dot(radiusvec, -cam2p1 / len_cp1) < 0.0LF;
+	}
+	else {
+		dist2nearest = len_cp0;
+		const double cosangle = abs(dot(cam2p1 / len_cp1, -normalize(edgevec)));
+		projected_edgelen = edgelen_d * (0.25LF + 0.75LF * sqrt(1.0LF - cosangle * cosangle));
+		const dvec3 radiusvec = normalize(p0.xyz);
+		beyondHorizon = dist2nearest > 400.0LF;
+		beyondHorizon = beyondHorizon && dot(radiusvec, -cam2p0 / len_cp0) < 0.0LF;		
+	}
+		
+		// note: By using true edgelen we ensure more details where needed (at constant memory budget), but we introduce far more ghost vertices (since irregular subdiv), which comes at a time-complexity cost.
+		// note: We don't use projected_edgelen since we loose details for grazing angle surfaces (which might have orthogonal details if subdivided).
+	const double cameraAltitude = length(cameraPositionKm) - planetRadiusKm - double(seaLevelKm);	
+	//const double elen = (lodf > 4.0) ? theoretical_edgelen * 1.2LF: edgelen_d * (1.0LF + 1.5LF*smoothstep(300.0LF, 1500.0LF, cameraAltitude)) ;
+	const double elen = (lodf > 4.0) ? edgelen_d * 0.9LF : edgelen_d * (1.0LF + 1.5LF*smoothstep(300.0LF, 1500.0LF, cameraAltitude)) ;
+	
+	double clod;
+	if (beyondHorizon || !needEdgeSplit(dist2nearest, elen, clod))
+	//if (beyondHorizon || !needEdgeSplit(dist2nearest, theoretical_edgelen * 1.2LF, clod))
+	//if (beyondHorizon || !needEdgeSplit(dist2nearest, projected_edgelen * 1.1LF))
+	//if (beyondHorizon || !needEdgeSplit(dist2nearest, edgelen_d * 0.9LF))	
+	{
+		return;
+	}		
+	bool applyCLOD = false;
+	
+	
+	
+	
+	
+	// --- We split the edge now ---	
+	
+	const bool ghost_split = false;//(vertex0.status == 1u) || (vertex1.status == 1u);//is it a ghost split ?
+	precise uint ss = E.status >> 8;//todo : remove precise qualifier
+	if (!ghost_split)
+		 edges[i].status = (ss << 8) | 2u;//mark the edge as split
+	else edges[i].status = (ss << 8) | 1u;//mark the edge as ghost split
+
+	// create middle vertex:
+	const float edgelen = float(edgelen_d);
+	int index = int(atomicCounterIncrement(vertexCounter));
+	Vertex middleVertex;
+	middleVertex.faces_0[0] = E.f0; middleVertex.faces_0[1] = -1; middleVertex.faces_0[2] = -1; middleVertex.faces_0[3] = -1;
+	middleVertex.faces_1[0] = E.f1; middleVertex.faces_1[1] = -1; middleVertex.faces_1[2] = -1; middleVertex.faces_1[3] = -1;
+	uint mseed = vertex0.seed + vertex1.seed;
+	if (mseed == 0u)
+		mseed = 497137451u;
+	middleVertex.seed = mseed;
+	middleVertex.status = ghost_split ? 1u:0u;
+	middleVertex.branch_count = 0u; 
+	middleVertex.type = TYPE_NONE;
+	edges[i].vm = index;	
+	
+	uint E0_type = E.type;
+	uint E1_type = E.type;
+	
+	const float max_tributary_slope = tan(3.0 * 3.1415926 / 180.0);//max slope of new river branches  :3.0 °
+	
+	const float elevation0 = float(p0.w);
+	const float elevation1 = float(p1.w);
+	const dvec4 d0 = attrib0.data;
+	const dvec4 d1 = attrib1.data;
+	dvec3 p = mix(p0.xyz, p1.xyz, 0.5LF);		
+	vec3 flow = normalize(mix(attrib0.flow.xyz, attrib1.flow.xyz, 0.5));	
+	if (attrib0.flow.xyz == vec3(0.0))
+		flow = attrib1.flow.xyz;
+	else if (attrib1.flow.xyz == vec3(0.0))
+		flow = attrib0.flow.xyz;
+	float flowvalue = mix(attrib0.flow.w, attrib1.flow.w, 0.5);
+	
+	double ground_elevation_d = mix(p0.w, p1.w, 0.5LF);
+	float ground_elevation = mix(elevation0, elevation1, 0.5);	
+	float max_elevation = mix(float(d0.z), float(d1.z), 0.5);
+	
+	float tectonic_altitude = max_elevation - seaLevelKm;//crust average altitude
+	float tectoAge = mix(attrib0.misc2.x, attrib1.misc2.x, 0.5);//crust age in Ma
+	//tectoAge = 100.0;//TEST ONLY		//105.0
+	if (tectoAge > 0.0)
+	{//TEST ONLY
+	//	tectonic_altitude *= 1.0 - 0.382 * smoothstep(0.0, 200.0, tectoAge);
+		//max_elevation = seaLevelKm + 1.8*tectonic_altitude;
+	}
+	
+	float plateau = mix(attrib0.misc2.y, attrib1.misc2.y, 0.5);// 0: no plateaux, 1:full plateaux.
+	//plateau = 1.0;//TEST ONLY
+	const float plateauLerp = plateau;// > 0.5 ? 1.0 : 0.0;
+		
+	float desert = mix(attrib0.misc2.z, attrib1.misc2.z, 0.5);
+	//desert = 1.0;//TEST ONLY
+	
+	float hills = mix(attrib0.misc1.z, attrib1.misc1.z, 0.5);
+	//hills = 0.0;//TEST ONLY
+	
+	//float distance2lakeCenter = mix(attrib0.misc2.z, attrib1.misc2.z, 0.5);
+	//float lakeWaterHeight = mix(attrib0.misc2.w, attrib1.misc2.w, 0.5);
+	float river_profile = mix(attrib0.misc2.w, attrib1.misc2.w, 0.5);
+		
+	double water_elevation = mix(d0.w, d1.w, 0.5LF);			
+	//double water_elevation = min(d0.w, d1.w);			
+	
+	double nearest_river_elevation = mix(d0.x, d1.x, 0.5LF);	
+	double distance2river = mix(d0.y, d1.y, 0.5LF);	
+	if (distance2river == 0.0LF)
+	{
+		if (vertex0.type == TYPE_LAKE_SHORE && vertex1.type == TYPE_LAKE_SHORE)
+			distance2river = 0.5LF * edgelen_d;//separate two neighboring lake boundaries
+		
+		if (d0.w != d1.w)
+		{
+			if (vertex1.type == TYPE_RIVER && vertex0.type != TYPE_RIVER)// && attrib1.data.w == p1.w))
+			{
+				if (attrib1.data.w == p1.w)
+					distance2river = 0.5LF * edgelen_d;//vattribs[v1].data.w = attrib0.data.w;//prevent artefact from occuring when nearby unrelated river springs connect to lakes
+				water_elevation = d0.w;//prevent non planarity of lake water (caused when nearby stream has differing water height)(this replaces quite efficiently the previous planarity code found in faceSplit_river.comp - yet does not warrant planarity in 100% of cases)
+			}
+			else if (vertex0.type == TYPE_RIVER && vertex1.type != TYPE_RIVER)// && attrib0.data.w == p0.w)
+			{
+				if (attrib0.data.w == p0.w)
+					distance2river = 0.5LF * edgelen_d;//vattribs[v0].data.w = attrib1.data.w;//prevent artefact from occuring when nearby unrelated river springs connect to lakes
+				water_elevation = d1.w;//prevent non planarity of lake water (caused when nearby stream has differing water height)(this replaces quite efficiently the previous planarity code found in faceSplit_river.comp - yet does not warrant planarity in 100% of cases)
+			}
+		}			
+	}
+	
+	
+	float nearest_ravin_elevation = mix(attrib0.misc1.x, attrib1.misc1.x, 0.5);
+	float distance2ravin = mix(attrib0.misc1.y, attrib1.misc1.y, 0.5);
+	float ravinflowvalue = mix(attrib0.misc1.w, attrib1.misc1.w, 0.5);
+	
+	float river_debug_info = 0.0;
+			
+	bool isriver = false;
+	bool isridge = false;
+	bool isdrainage = false;
+	bool islake_shore = false;
+	bool ocean_case = (elevation0 < seaLevelKm || elevation1 < seaLevelKm);
+	
+	if (E.type == TYPE_RIVER)
+	{
+		middleVertex.type = TYPE_RIVER;
+		distance2river = 0.0LF;
+	}
+	else if (vertex0.type == TYPE_RIVER && vertex1.type == TYPE_RIVER)
+	{
+		distance2river = 0.5LF * edgelen_d;	
+		double w0 = double(attrib0.flow.w);
+		w0 *= w0;
+		double w1 = double(attrib1.flow.w);
+		w1 *= w1;
+		double s = w0 + w1;
+		if (s != 0.0LF)
+			water_elevation = (w0 * d0.w + w1 * d1.w) / s;//weighted blend of the two water elevations (for the two rivers) : the bigger the flow the greater the weight.		
+		
+		if (lodf < 5.0)
+			flow = vec3(0.0);//? is this obsolete now ?
+	}
+	else if (vertex0.type == TYPE_RIVER && vertex1.type != TYPE_LAKE_SHORE)
+	{
+		if (lodf < 6.0)
+			water_elevation = d0.w;
+		else {
+			const Edge adjacentRiverEdge = getAdjacentRiverEdge(E);
+			int other_riververtex_index = adjacentRiverEdge.v0 == v0 ? adjacentRiverEdge.v1 : adjacentRiverEdge.v0;
+			const VertexAttrib other_riverattrib = vattribs[other_riververtex_index];
+			dvec3 river_vector = other_riverattrib.position.xyz - p0.xyz;
+			//project vertex onto river_vector:
+			const double riverlen = length(river_vector);
+			const double projlen = dot(p.xyz - p0.xyz, river_vector) / riverlen;
+			double lerp = clamp(projlen / riverlen, 0.0LF, 1.0LF);
+			water_elevation = mix(d0.w, other_riverattrib.data.w, lerp);	
+			
+			//distance2river = distance(p.xyz, (p0.xyz + (lerp * river_vector)));	
+		}
+		
+		//distance2river = 0.5LF * edgelen_d;//cannot decomment this line, otherwise ALL lakes get deconnected from the river network
+	}
+	else if (vertex1.type == TYPE_RIVER && vertex0.type != TYPE_LAKE_SHORE)
+	{
+		if (lodf < 6.0)
+			water_elevation = d1.w;
+		else {
+			const Edge adjacentRiverEdge = getAdjacentRiverEdge(E);
+			int other_riververtex_index = adjacentRiverEdge.v1 == v1 ? adjacentRiverEdge.v0 : adjacentRiverEdge.v1;
+			const VertexAttrib other_riverattrib = vattribs[other_riververtex_index];
+			dvec3 river_vector = other_riverattrib.position.xyz - p1.xyz;
+			//project vertex onto river_vector:
+			const double riverlen = length(river_vector);
+			const double projlen = dot(p.xyz - p1.xyz, river_vector) / riverlen;
+			double lerp = clamp(projlen / riverlen, 0.0LF, 1.0LF);
+			water_elevation = mix(d1.w, other_riverattrib.data.w, lerp);						
+		
+			
+			//distance2river = distance(p.xyz, (p1.xyz + (lerp * river_vector)));					
+		}
+		
+		//distance2river = 0.5LF * edgelen_d;
+	}
+	/*else if (vertex0.type == TYPE_RIVER && vertex1.type == TYPE_LAKE_SHORE)
+	{
+		water_elevation = d0.w;	
+	}
+	else if (vertex1.type == TYPE_RIVER && vertex0.type == TYPE_LAKE_SHORE)
+	{
+		water_elevation = d1.w;	
+	}*/
+	else if (optionGenerateDrainage == 1u && (vertex0.type == TYPE_DRAINAGE || vertex1.type == TYPE_DRAINAGE) && E.type != TYPE_DRAINAGE)
+		distance2ravin = 0.5 * edgelen;
+	else if (optionGenerateDrainage == 1u && E.type == TYPE_DRAINAGE)
+	{
+		distance2ravin = 0.0;
+		middleVertex.type = TYPE_DRAINAGE;
+	}
+	
+	//
+	seed(middleVertex.seed);
+	
+	////////////////
+	if (ghost_split)
+	{		
+		ground_elevation_d = length(p) - planetRadiusKm;	
+
+		if (E.type == TYPE_RIVER && vertex0.type == TYPE_RIVER && vertex1.type == TYPE_RIVER)
+		{			
+			nearest_river_elevation = ground_elevation_d;
+		}
+		else if (E.type == TYPE_RIVER)
+		{
+			if (vertex0.type == TYPE_RIVER)
+			{				
+				flow = vec3(normalize(p0.xyz - p1.xyz));
+				nearest_river_elevation = ground_elevation_d;//double(mix(elevation0, elevation1, 0.4 + 0.2*random()));					
+				river_profile = attrib0.misc2.w + 0.05 * random();
+				//river_debug_info = attrib0.padding_and_debug.w;
+				water_elevation = nearest_river_elevation;//spring
+				flowvalue = springFlowValueDefault;
+				E1_type = TYPE_NONE;//terrain edge
+				river_debug_info = 0.0;				
+			}
+			else
+			{
+				flow = vec3(normalize(p1.xyz - p0.xyz));
+				nearest_river_elevation = ground_elevation_d;//double(mix(elevation1, elevation0, 0.4 + 0.2*random()));					
+				river_profile = attrib1.misc2.w + 0.05 * random();
+				//river_debug_info = attrib1.padding_and_debug.w;
+				water_elevation = nearest_river_elevation;//spring
+				flowvalue = springFlowValueDefault;
+				E0_type = TYPE_NONE;//terrain edge
+				river_debug_info = 0.0;
+			}
+		}
+		else if (optionGenerateDrainage == 1u && E.type == TYPE_DRAINAGE)
+		{
+			nearest_ravin_elevation = float(ground_elevation_d);
+		}	
+		else if (optionGenerateDrainage == 1u  && E.type != TYPE_DRAINAGE)
+		{
+			if (vertex0.type == TYPE_DRAINAGE && vertex1.type != TYPE_DRAINAGE)
+				nearest_ravin_elevation = elevation0;
+			else if (vertex1.type == TYPE_DRAINAGE && vertex0.type != TYPE_DRAINAGE)
+				nearest_ravin_elevation = elevation1;
+		}
+	}
+	////////////////
+	else 
+	{
+		if (E.type == TYPE_RIVER && vertex0.type == TYPE_RIVER && vertex1.type == TYPE_RIVER)
+		{		
+			// displace horizontally the new vertex:
+			if (lodf > 2.0)
+			{
+				p = applyHorizontalDisplacement(p0.xyz, p1.xyz, E, int(i));
+			}
+			
+			dvec3 sink_pos = p0.xyz;
+			dvec3 source_pos = p1.xyz;
+			double r = 0.0LF;//0.05LF * double(random());
+			float fr = random();
+			if (elevation1 < elevation0)
+			{
+				sink_pos = p1.xyz;
+				source_pos = p0.xyz;
+				r += 0.75LF;
+				fr = 0.1*fr;
+			}
+			else {
+				r += 0.25LF;
+				fr = 0.9 + 0.1*fr;
+			}
+			if (lodf < 8.0)
+				flow = vec3(normalize(sink_pos - p));	
+			
+			r = mix(r, 0.5LF, double(step(8.0, lodf)));			
+			flowvalue = mix(attrib0.flow.w, attrib1.flow.w, fr);
+			ground_elevation = mix(elevation0, elevation1, float(r));			
+			water_elevation = mix(d0.w, d1.w, r);//use same interpolation factor to ensure visibility of water (otherwise some sections of rivers could turn "dry")	
+			nearest_river_elevation = double(ground_elevation);						
+			//nearest_ravin_elevation = float(water_elevation);//trick! (this is to break the sealevel ad hoc value set by default in base mesh)			
+			river_debug_info = mix(attrib0.padding_and_debug.w, attrib1.padding_and_debug.w, 0.5);
+		}
+		else if (E.type == TYPE_RIVER)// case of a temporary spring
+		{			
+			//bool makespring = true;//(lodf > 3.0) || random() < lodf * 0.2;
+			float max_spring_offset = min(1.5, max_tributary_slope * 0.6 * edgelen);	
+			
+			if (vertex0.type == TYPE_RIVER)
+			{				
+				p = mix(p0.xyz, p1.xyz, double(0.6+ 0.2*random()));
+				flow = vec3(normalize(p0.xyz - p1.xyz));
+				//flowvalue = attrib0.flow.w *0.9;								
+				//max_spring_offset = mix(0.001, max_spring_offset, 1.0 - smoothstep(0.0, 0.6, attrib0.flow.w));//attempt to minimize water planarity artefacts..
+				ground_elevation = min(elevation0 + max_spring_offset, mix(elevation0, elevation1, 0.4 + 0.2*random()));  
+				nearest_river_elevation = double(ground_elevation);					
+				river_profile = attrib0.misc2.w + 0.05 * random();
+				//river_debug_info = 0.0;//attrib0.padding_and_debug.w;
+				//if (!makespring)
+				//{
+				//	water_elevation = nearest_river_elevation + (d0.w - p0.w);//+ double(0.001 + random() * 0.003);										
+				//}
+				//else {
+					//water_elevation = min(d0.w - p0.w + double(ground_elevation), nearest_river_elevation + 0.002LF);//spring
+					water_elevation = nearest_river_elevation;// - 0.0005LF;
+					flowvalue = springFlowValueDefault;
+					E1_type = TYPE_NONE;//terrain edge
+					//river_debug_info = 0.0;
+				//}
+				
+				//vattribs[v1].data.y = 0.1LF * edgelen_d;//EXPERIMENTAL!
+			}
+			else
+			{
+				p = mix(p1.xyz, p0.xyz, double(0.6 + 0.2*random()));
+				flow = vec3(normalize(p1.xyz - p0.xyz));
+				//flowvalue = attrib1.flow.w * 0.9;				
+				//max_spring_offset = mix(0.001, max_spring_offset, 1.0 - smoothstep(0.0, 0.6, attrib1.flow.w));//attempt to minimize water planarity artefacts..
+				ground_elevation = min(elevation1 + max_spring_offset, mix(elevation1, elevation0, 0.4 + 0.2*random()));  
+				nearest_river_elevation = double(ground_elevation);					
+				river_profile = attrib1.misc2.w + 0.05 * random();
+				//river_debug_info = 0.0;//attrib1.padding_and_debug.w;
+				//if (!makespring)
+				//{
+				//	water_elevation = nearest_river_elevation + (d1.w - p1.w);//double(0.001 + random() * 0.003);					
+				//}
+				//else {
+					//water_elevation = min(d0.w - p0.w + double(ground_elevation), nearest_river_elevation + 0.002LF);//spring
+					water_elevation = nearest_river_elevation;// - 0.0005LF;
+					flowvalue = springFlowValueDefault;
+					E0_type = TYPE_NONE;//terrain edge
+					//river_debug_info = 0.0;
+				//}
+				
+				//vattribs[v0].data.y = 0.1LF * edgelen_d;//EXPERIMENTAL!
+			}
+		}
+		else if (E.type == TYPE_DRAINAGE && !(vertex0.type == TYPE_RIVER && vertex1.type == TYPE_RIVER) && optionGenerateDrainage == 1u)
+		{
+			p = applyHorizontalDisplacement(p0.xyz, p1.xyz, E, int(i));
+			
+			const float minalt = min(elevation0, elevation1);
+			const float maxalt = max(elevation0, elevation1);
+			ground_elevation = mix(minalt, maxalt, 0.4 + 0.1 * random());	
+				
+			if (vertex0.type == TYPE_RIVER &&  ground_elevation < elevation0)
+			{//ensure water stays below local elevation
+				const float adaptive = min(0.5, 0.1*edgelen);
+				ground_elevation = elevation0 + 0.03 + adaptive * random();
+			} else if (vertex1.type == TYPE_RIVER &&  ground_elevation < elevation1)
+			{
+				const float adaptive = min(0.5, 0.1*edgelen);
+				ground_elevation = elevation1 + 0.03 + adaptive * random();
+			}
+			
+			nearest_ravin_elevation = ground_elevation;				
+		}
+		else if (E.type== TYPE_DRAINAGE)
+		{
+			nearest_ravin_elevation = ground_elevation;
+		}
+		else 
+		{						
+			//ground_elevation = mix(elevation0, elevation1, 0.5);	
+			if (!ocean_case)
+			{				
+				if (E.type != TYPE_RIVER && distance2river == 0.0LF)//vertex0.type == TYPE_LAKE_SHORE || vertex1.type == TYPE_LAKE_SHORE) //(d0.y == 0.0LF && d1.y == 0.0LF)//case: lake shore
+				{//concerns lakes => displacement
+					//if (lodf < 8.0)
+					//{
+						dvec3 tmp = p;
+						p = applyHorizontalDisplacement(p0.xyz, p1.xyz, E, int(i));
+						p = mix(tmp, p, 0.25LF);//not too much, otherwise lake water surface will exhibit squshing
+					//}
+				}
+				//else
+				if (vertex0.type == TYPE_RIVER && vertex1.type == TYPE_RIVER)
+				{
+					const float adaptive = 0.2*edgelen;
+					const float delta = min(tectonic_altitude, adaptive);
+					const float base_alt = min(adaptive, 0.05) + max(elevation0, elevation1);				
+					float r = random();
+					//r = mix(r, 1.0 - r*r*r, plateauLerp);//this is not very meaningful visually
+					ground_elevation = max(base_alt, seaLevelKm + (1.0 - 0.95*r*r) * delta);						
+					//ground_elevation = max(base_alt, seaLevelKm + (1.0 - 0.95*r)* delta);						
+					//ground_elevation = max(base_alt, seaLevelKm + (0.05 + 0.95*r*r)* delta);						
+				}
+				else if (E.type != TYPE_DRAINAGE && vertex0.type == TYPE_DRAINAGE && vertex1.type == TYPE_DRAINAGE && optionGenerateDrainage == 1u)
+				{
+					const float adaptive = 0.2*edgelen;
+					const float delta = min(tectonic_altitude, adaptive);
+					const float base_alt = min(adaptive, 0.025) + max(elevation0, elevation1);				
+					float r = random();
+					r = mix(r, 1.0 - r*r*r, plateauLerp);
+					ground_elevation = max(base_alt, seaLevelKm + (1.0 - 0.95*r*r) * delta);
+				}				
+				else if (vertex0.type == TYPE_RIVER)// && vertex1.type != TYPE_DRAINAGE)
+				{
+					const float min_alt = elevation0;				
+					const float adaptive = min(max(0.1, (tectonic_altitude - min_alt)), 0.2*edgelen);				
+					float r = random();
+					r = mix(r, 1.0 - r*r*r, plateauLerp);
+					if (min_alt > elevation1) 
+						ground_elevation = min_alt + (0.05+0.95*r) * adaptive;//this case should not happen and in practice doesn't appear much	(and anyway this is an old rule before we introduced postprocessed profiles)					
+					else 
+						ground_elevation = mix(min_alt, elevation1, 0.1 + 0.9*r);//note:0.1 is there as a legacy value before we introduced profiles. Consider getting rid of it!
+					
+					//const float alt_bank = min(max_elevation + 0.07LF, p0.w + distance2river * riverbank_slope * sqrt(smoothstep(0.0LF, 3.0LF, tectonic_altitude)));
+					//float r = float(random());
+					//r = (1.0LF - r*r) * smoothstep(-0.2LF, 0.8LF, distance2river);// * (1.0LF - step(3.0LF, tectonic_altitude));
+					//ground_elevation = max(min_alt, mix(alt_bank, ground_elevation, r));
+					
+					//flow = attrib0.flow.xyz;
+					//nearest_river_elevation = p0.w;//this line was missing so now check that it doesn't break river junctions...					
+										
+					if (optionGenerateLakes == 1u && vertex1.type != TYPE_LAKE_SHORE && vertex0.branch_count == 0  && lodf < 5.0 && d0.w != p0.w && nearest_river_elevation > double(seaLevelKm + 0.01))//&& lodf > 0.0 
+					{//last predicate is here to prevent forming lakes near river mouth, otherwise some artefacts may arise.
+						const float lake_base_proba = 0.1;
+						const float lake_inflow_constraint = (1.0 - clamp(lodf *0.25, 0.0, 1.0));// * (1.0 - attrib0.flow.w * attrib0.flow.w);//the bigger the flow and the smaller the lake the less chance of creating a lake 
+						//const float altitude_factor = smoothstep(0.0, 1.0, tectonic_altitude) + 2.0*smoothstep(1.5, 2.5, tectonic_altitude);//the higher is the surrounding ground, the greater chance to have lakes
+						const float altitude_factor = smoothstep(0.2, 1.0, elevation0 - seaLevelKm) + 2.0*smoothstep(1.5, 2.5, tectonic_altitude);//the higher is the surrounding ground, the greater chance to have lakes
+						const float lake_proba = lake_base_proba * lake_inflow_constraint * altitude_factor * (1.0 - 0.9*desert);
+						if (random() < lake_proba)
+						{
+							p = applyHorizontalDisplacement(p0.xyz, p1.xyz, E, int(i));
+							
+							water_elevation = d0.w;
+							middleVertex.type = TYPE_LAKE_SHORE;
+							distance2river = 0.0LF;
+							flowvalue = attrib0.flow.w;
+							river_profile = attrib0.misc2.w;
+							ground_elevation = elevation0 - (0.02 + 0.1 * random());
+							nearest_river_elevation = double(ground_elevation);//	p0.w
+							
+							middleVertex.prim2 = v0;//store adjacent river vertex index
+						}						
+					}	
+				}
+				else if (vertex1.type == TYPE_RIVER)// && vertex0.type != TYPE_DRAINAGE)
+				{
+					const float min_alt = elevation1;				
+					const float adaptive = min(max(0.1, (tectonic_altitude - min_alt)), 0.2*edgelen);					
+					float r = random();
+					r = mix(r, 1.0 - r*r*r, plateauLerp);
+					if (min_alt > elevation0)
+						ground_elevation = min_alt + (0.05+0.95*r) * adaptive;//this case should not happen and in practice doesn't appear much	(and anyway this is an old rule before we introduced postprocessed profiles)	
+					else 
+						ground_elevation = mix(min_alt, elevation0, 0.1 + 0.9*r);
+					
+					//flow = attrib1.flow.xyz;
+					//nearest_river_elevation = p1.w;					
+					//middleVertex.type = TYPE_RIDGE;	
+					
+					if (optionGenerateLakes == 1u && vertex0.type != TYPE_LAKE_SHORE && vertex1.branch_count == 0 && lodf < 5.0 && d1.w != p1.w && nearest_river_elevation > double(seaLevelKm + 0.01))//&& lodf > 1.0 //&& attrib1.flow.w > 0.01
+					{
+						const float lake_base_proba = 0.1;
+						const float lake_inflow_constraint = (1.0 - clamp(lodf *0.25, 0.0, 1.0));// * (1.0 - attrib1.flow.w *attrib1.flow.w);//the bigger the flow and the smaller the lake the less chance of creating a lake 
+						//const float altitude_factor = smoothstep(0.0, 1.0, tectonic_altitude) + 2.0*smoothstep(1.5, 2.5, tectonic_altitude);//the higher is the surrounding ground, the greater chance to have lakes
+						const float altitude_factor = smoothstep(0.2, 1.0, elevation1 - seaLevelKm) + 2.0*smoothstep(1.5, 2.5, tectonic_altitude);//the higher is the surrounding ground, the greater chance to have lakes
+						const float lake_proba = lake_base_proba * lake_inflow_constraint * altitude_factor * (1.0 - 0.9*desert);
+						if (random() < lake_proba)
+						{
+							p = applyHorizontalDisplacement(p0.xyz, p1.xyz, E, int(i));
+							
+							water_elevation = d1.w;							
+							middleVertex.type = TYPE_LAKE_SHORE;
+							distance2river = 0.0LF;								
+							flowvalue = attrib1.flow.w;		
+							river_profile = attrib1.misc2.w;							
+							ground_elevation = elevation1 - (0.02 + 0.1 * random());
+							nearest_river_elevation = double(ground_elevation);//	p1.w
+							
+							middleVertex.prim2 = v1;//store adjacent river vertex index (used at planarity enforcement of the lake in facesplit_river.comp)
+						}
+					}		
+				}
+				else if (vertex0.type == TYPE_DRAINAGE && optionGenerateDrainage == 1u)//these two rules cause degenerated triangles (the rules are too harsh) FIXME
+				{					
+					const float min_alt = elevation0;
+					float r = random();
+					r = mix(r, 1.0 - r*r, plateauLerp);
+					if (min_alt > elevation1)
+					{
+						const float adaptive = min( max(0.1, max_elevation - min_alt), 0.2*edgelen );					
+						ground_elevation = min_alt + (0.4 + 0.4*r) * adaptive;
+					}else
+					{						
+						const float adaptive = min( max(0.01, max_elevation - elevation1), 0.1*edgelen );					
+						const float max_alt = elevation1 + adaptive;
+						ground_elevation = mix(min_alt, max_alt, 0.4 + 0.4*r);
+						//ground_elevation = mix(min_alt, max_alt, r);
+					}					
+					//ground_elevation = max(float(water_elevation + 0.02LF), ground_elevation);
+					
+					nearest_ravin_elevation = elevation0;
+					//distance2ravin = float(distance(p.xyz, attrib0.position.xyz));//mandatory otherwise we cannot detect special case where v0 and v1 are Drainage vertices and E is not, due to special case in FAceSplitRiver (see determinism stuff).
+					//middleVertex.type = TYPE_RIDGE;
+				}
+				else if (vertex1.type == TYPE_DRAINAGE && optionGenerateDrainage == 1u)
+				{					
+					const float min_alt = elevation1;	
+					float r = random();
+					r = mix(r, 1.0 - r*r, plateauLerp);					
+					if (min_alt > elevation0)
+					{
+						const float adaptive = min( max(0.1, max_elevation - min_alt), 0.2*edgelen );					
+						ground_elevation = min_alt + (0.4 + 0.4*r) * adaptive;
+					} else 
+					{						
+						const float adaptive = min( max(0.01, max_elevation - elevation0), 0.1*edgelen );					
+						const float max_alt = elevation0+ adaptive;
+						ground_elevation = mix(min_alt, max_alt, 0.4 + 0.4*r);
+						//ground_elevation = mix(min_alt, max_alt, r);
+					}					
+					//ground_elevation = max(float(water_elevation + 0.02LF), ground_elevation);
+					 
+					nearest_ravin_elevation = elevation1;					
+					//distance2ravin = float(distance(p.xyz, attrib1.position.xyz));//mandatory otherwise we cannot detect special case where v0 and v1 are Drainage vertices and E is not, due to special case in FAceSplitRiver (see determinism stuff).
+					//middleVertex.type = TYPE_RIDGE;
+				}
+				else
+				{
+					applyCLOD = true;
+					
+					if (lodf < 9.0)// && random() < (1.0 - lodf*0.05))// && vertex0.type == TYPE_RIDGE && vertex1.type == TYPE_RIDGE) && E.type != TYPE_OCTAHEDRON_EDGE && 
+					{//displacement:
+					
+						dvec3 tmp = p;
+						p = applyHorizontalDisplacement(p0.xyz, p1.xyz, E, int(i));
+						p = mix(tmp, p, double(0.5 + desert * 0.45));
+						/*int va, vb;
+						getSurroundingVertices(int(i), E, va, vb);
+						int vx = va;
+						if (random() < 0.5)
+							vx = vb;
+						dvec4 px = vattribs[vx].position;
+						double r = double(0.38 + 0.24*random());
+						p = mix(p0.xyz, p1.xyz, r);
+						double s = double((0.2 + 0.8*desert) * 0.5 * random() * (1.0 - lodf*0.1));
+						p = mix( p,  0.33333333LF * (p0.xyz + p1.xyz + px.xyz), s);						
+						*/
+					}					
+										
+					const float max_alt = max(elevation0, elevation1);
+					const float min_alt = min(elevation0, elevation1);					
+					
+					const float altlerp = clamp(tectonic_altitude, 0.0, 5.0) / 5.0 ;
+					const float nlodf = clamp(lodf, 0.0, 10.0)/10.0;
+					const float max_spread = 1.0 - 0.4 * nlodf;
+					
+					// base subdiv: 2 main cases [YOUNG OROGENY] and [OLD OROGENY], for the latter 2 subcases [DRY] or [WET]
+					float r = random();		
+					const float agelerp = clamp(smoothstep(0.0, 200.0, tectoAge) + 0.38*desert, 0.0, 1.0);
+					const float old_dry_elevation = mix(min_alt, max_alt, 0.5 - max_spread*0.4 + 0.4*max_spread*r);// gives massifs kind of sculpted by wind (good for desert?)				
+					const float old_wet_elevation = mix(min_alt, max_alt, 1.0 - max_spread*0.6 + 0.6*max_spread*r);//0.4 + 0.6*random());// gives old round massifs				
+					const float old_elevation = mix(old_wet_elevation, old_dry_elevation, desert);//old_wet_elevation;//
+					ground_elevation = mix(min_alt, max_alt, 0.5 - max_spread * 0.5 + max_spread * pow(r, 1.5));//gives sharp mountains						
+					ground_elevation = mix(ground_elevation, old_elevation, agelerp * (1.0 - nlodf));
+						
+					// mesas, table mountain, terrace fx:
+					float terraces_elevation = ground_elevation;
+					//float desert_lod = nlodf;
+					const float stepheight = 0.7;
+					const float roffset = 0.0;//0.4 * random();
+					float step_elevation = floor(roffset + terraces_elevation / stepheight) * stepheight - roffset;//raw step
+					float smoothstep_elevation = step_elevation + smoothstep(0.0, stepheight, terraces_elevation - step_elevation) * stepheight;//smooth step
+					terraces_elevation = mix(smoothstep_elevation, step_elevation, 0.0 + 0.9*random()*(1.0 - smoothstep(2.0, 2.8, smoothstep_elevation - seaLevelKm)));//mix them
+					const dvec3 normedPos = normalize(p);
+					const float latitude = float(normedPos.z * normedPos.z);
+					const float rockAltitudeInDesert = 3.7 - 2.2 * latitude - 4.0 * desert * (1.0 - 0.7*agelerp);//note: this mimicks the code in final.frag for rendering and texturing.
+					const float rockAltitudeThreshold = clamp(ground_elevation -seaLevelKm - rockAltitudeInDesert, 0.0, 0.25) * 4.0;
+					//const float cap_elevation = mix(max_elevation, seaLevelKm + 0.9, step(0.9, random()));
+					//terraces_elevation = min(cap_elevation, terraces_elevation);
+					ground_elevation = mix(ground_elevation, terraces_elevation, agelerp * (1.0 - nlodf*nlodf) * sqrt(desert) * rockAltitudeThreshold);
+										
+					// add secondary peaks and ridges at low LOD (with a smooth falloff towards higher lod):
+					r = random();					
+					const float random_alt_old_dry = 0.01 + seaLevelKm  + r*tectonic_altitude;//good for eolian desert
+					const float random_alt_old_wet = 0.01 + seaLevelKm  +  (1.0 - r*r)  * tectonic_altitude;//gives old massifs
+					const float random_alt_old = mix(random_alt_old_wet, random_alt_old_dry, desert);
+					const float random_alt_young = 0.01 + seaLevelKm  + r*r * tectonic_altitude;//good for alpins as well as eolian desert
+					const float random_alt = mix(random_alt_young, random_alt_old, agelerp);
+					
+					const float lodstep = smoothstep(0.0, 1.0, smoothstep(0.0, 6.0 + (1.0 - altlerp) * 3.0, lodf));
+					// =====> was the following, but I suspect using nearest_river_elevation causes problems : 
+					//const float threshold = mix(float(nearest_river_elevation), min_alt, lodstep) + (1.0 - lodstep) * (random() * (0.07 + altlerp * 0.6));						
+					// changed to:
+					const float threshold = min_alt + (1.0 - lodstep) * (random() * (0.07 + altlerp * 0.6));
+					float random_elevation = max(threshold, mix(random_alt, ground_elevation, lodstep));
+					
+					// Hills:
+					r = random();
+					//const float hill_fx = min(1.0, mix(r*r, 1.0 - r*r, agelerp) * 0.5*( (lod % 2) == 0 ? -0.5*edgelen: edgelen ));//(1.0 - step(0.1, desert))
+					const float hill_fx = min(0.8, (1.0-r*r) * 0.5*( random() <0.5 ? -0.3*edgelen: edgelen ));//
+					random_elevation = max(seaLevelKm + 0.001, random_elevation + hills * hill_fx * (1.0 - lodstep) * (1.0 - step(0.1, desert)) * smoothstep(0.0, 25.0, float(distance2river)));
+									
+					// mix to yield plateaux:
+					ground_elevation = mix(random_elevation, ground_elevation, 0.88*plateauLerp);
+					
+				}			
+			}
+			
+			else if ((elevation0 < seaLevelKm && elevation1 > seaLevelKm) || (elevation0 > seaLevelKm && elevation1 < seaLevelKm))
+			{// Coast case:
+			
+				applyCLOD = true;
+				
+				if (lodf < 11.0)// && vertex0.type == TYPE_RIDGE && vertex1.type == TYPE_RIDGE) && E.type != TYPE_OCTAHEDRON_EDGE && 
+				{//displacement:
+				
+					p = applyHorizontalDisplacement(p0.xyz, p1.xyz, E, int(i));
+					
+					/*int va, vb;
+					getSurroundingVertices(int(i), E, va, vb);
+					//float r = random();
+					//double rx = double(0.2 * r * (1.0 - 0.9*smoothstep(0.0, 12.0, lodf)));
+					//double r0 = (1.0LF - rx) * (0.45LF + 0.05LF * double(random()));
+					//double r1 = 1.0LF - rx - r0;
+					//int vx = va;
+					//if (random() < 0.5)
+					//	vx = vb;
+					//dvec4 px = vattribs[vx].position;
+					//p = rx * px.xyz + r0 * p0.xyz + r1 * p1.xyz;//barycentric displacement ensures new position lies within the neighboring triangle.
+					//barycentric displacement ensures new position lies within the neighboring triangle' safe zone:
+					int vx = va;
+					if (random() < 0.5)
+						vx = vb;
+					dvec4 px = vattribs[vx].position;
+					double r0 = double(0.33 + 0.33*random());
+					double r1 = 1.0LF - r0;
+					p = r0 * p0.xyz + r1*p1.xyz;
+					double rx = double((1.0 - 0.9*smoothstep(0.0, 12.0, lodf)) * 0.33 * random());
+					p = (1.0LF - rx) * p + rx * 0.33333333LF * (p0.xyz + p1.xyz + px.xyz);
+					*/
+				}			
+			}
+		}
+		
+		p = normalize(p);
+		ground_elevation_d = double(ground_elevation);
+		p *= (planetRadiusKm + ground_elevation_d);				
+
+	}
+	
+	//clod:
+	if (ENABLE_CLOD && !ghost_split && applyCLOD && distance2river != 0.0LF)
+	{
+		//double water_height_offset = water_elevation - ground_elevation_d;
+		
+		const dvec3 ref_middle_pos = mix(p0.xyz, p1.xyz, 0.5LF);
+		const double ref_ground_elevation = length(ref_middle_pos) - planetRadiusKm;
+		const double ref_nearest_river_elevation = mix(d0.x, d1.x, 0.5LF);
+		
+		p = mix(ref_middle_pos, p, clod);
+		ground_elevation_d = mix(ref_ground_elevation, ground_elevation_d, clod);
+		nearest_river_elevation = mix(ref_nearest_river_elevation, nearest_river_elevation, clod);		
+		//clod = smoothstep(0.0LF, 4.0LF, clod);
+		//p = mix(p, ref_middle_pos, clod);
+		//ground_elevation_d = mix(ground_elevation_d, ref_ground_elevation, clod);
+		//nearest_river_elevation = mix(nearest_river_elevation, ref_nearest_river_elevation, clod);		
+	}		
+	
+	//if (distance2river == 0.0LF)
+	//{
+		//if (d0.w != d1.w && ((vertex1.type == TYPE_RIVER && vertex0.type != TYPE_RIVER && vertex0.type != TYPE_LAKE_SHORE) || (vertex0.type == TYPE_RIVER && vertex1.type != TYPE_RIVER && vertex1.type != TYPE_LAKE_SHORE)))
+		//	distance2river = 0.5LF * edgelen_d;
+	//}	
+		
+	VertexAttrib a;
+	a.position = dvec4(p, ground_elevation_d);
+	a.data = dvec4(nearest_river_elevation, distance2river, double(max_elevation), water_elevation);
+	a.flow = vec4(flow, flowvalue);
+	a.misc1 = vec4(nearest_ravin_elevation, distance2ravin, hills, ravinflowvalue);
+	a.misc2 = vec4(tectoAge, plateau, desert, river_profile);
+	a.padding_and_debug = vec4(ghost_split ? 1.0:0.0, 0.0, 0.0, river_debug_info);
+	vattribs[index] = a;
+	
+	if (middleVertex.type == TYPE_NONE)
+	{
+		if (vertex0.type != TYPE_SEA && vertex1.type != TYPE_SEA)// && t0 != TYPE_COAST)
+		{
+			//if (t1 != TYPE_SEA)// && t1 != TYPE_COAST)
+				middleVertex.type = TYPE_CONTINENT;//TYPE_RIDGE;//TYPE_CONTINENT;
+			//else middleVertex.type = ground_elevation > seaLevelKm ? TYPE_CONTINENT : TYPE_SEA;
+		}
+		else middleVertex.type = ground_elevation_d > double(seaLevelKm) ? TYPE_CONTINENT : TYPE_SEA;
+	}
+		
+	vertices[index] = middleVertex;
+
+	// create 2 subedges
+	const int s0 = int(atomicCounterIncrement(edgeCounter));
+	uint substatus = (lod + 1u) << 16;
+	if (ghost_split)
+		substatus |= 1u << 8;
+	Edge e;
+	e.v0 = E.v0;
+	e.v1 = index;
+	e.vm = -1;
+	e.status = substatus;
+	e.child0 = -1;
+	e.child1 = -1;
+	e.f0 = E.f0;
+	e.f1 = E.f1;
+	e.type = E0_type;
+	edges[s0] = e;
+	
+	const int s1 = int(atomicCounterIncrement(edgeCounter));
+	e.v0 = index;
+	e.v1 = E.v1;
+	e.vm = -1;
+	e.status = substatus;
+	e.child0 = -1;
+	e.child1 = -1;
+	e.f0 = E.f0;
+	e.f1 = E.f1;
+	e.type = E1_type;
+	edges[s1] = e;
+		
+	edges[i].child0 = s0;
+	edges[i].child1 = s1;
+}

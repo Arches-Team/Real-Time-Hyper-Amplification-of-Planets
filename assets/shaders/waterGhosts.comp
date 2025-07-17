@@ -1,0 +1,123 @@
+#version 450
+
+// --- structures de données ---
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Vertex
+{
+	/// first list of indexes of incident faces (or -1 if none)
+	int faces_0[4];
+	/// second list of indexes of incident faces (or -1 if none)
+	int faces_1[4];
+	/// PRNG seed
+	uint seed;
+	/// boolean = ghost or not ghost vertex
+	uint status;
+	//
+	uint type;
+	///
+	uint branch_count; 	
+	/// indexes of the vertices acting as river primitives
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;		
+	//int pad[4];
+};
+struct WaterVertexAttrib
+{
+	/// xyz = 3D position, w = average water altitude (before wave displacement)
+	dvec4 position;
+	/// xyz = normal to water surface, w = unused
+	vec4 normal;
+	/// xyz = water flow direction normalized, w = unused
+	vec4 flow;
+	
+	/// indexes of the vertices acting as river primitives
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;		
+	//int pad[4];
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) readonly buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 1, std430) readonly buffer vertices_buffer
+{
+	Vertex vertices[];
+};
+layout(binding = 2, std430) coherent buffer water_vattribs_buffer 
+{
+  WaterVertexAttrib water_vattribs[];
+};
+
+
+// --- uniforms ---
+uniform uint lastEdgeIndex;
+uniform double planetRadiusKm;
+uniform double seaLevelKm;
+
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint index = gl_GlobalInvocationID.x;
+	if (index > lastEdgeIndex)
+		return;
+
+	//return;//!
+	
+	const Edge E = edges[index];
+	uint se0 = E.child0;
+	uint se1 = E.child1;
+	if ((edges[se0].status & 255u) != 0u)
+		return;//check that the two subedges are not split (last LOD).
+	if ((edges[se1].status & 255u) != 0u)
+		return;	
+	
+	const Vertex V = vertices[E.vm];
+	if (V.status != 1u)
+		return;//only interested in ghost vertices
+	
+	const dvec3 NO_WATER = dvec3(0.0LF);
+	
+	const WaterVertexAttrib attrib = water_vattribs[E.vm];
+	if (attrib.position.xyz == NO_WATER)
+		return;		
+	const WaterVertexAttrib attrib0 = water_vattribs[E.v0];
+	const WaterVertexAttrib attrib1 = water_vattribs[E.v1];
+	
+	if (attrib0.position.xyz != NO_WATER && attrib1.position.xyz != NO_WATER)
+	{
+		const dvec3 p0 = normalize(attrib0.position.xyz) * (planetRadiusKm + attrib0.position.w);
+		const dvec3 p1 = normalize(attrib1.position.xyz) * (planetRadiusKm + attrib1.position.w);
+		
+		const dvec3 ghostPos = mix(p0, p1, 0.5LF);//relocate middle vertex (ghost) of the edge exactly in between the two end vertices of the edge.
+		const double ghostElevation = length(ghostPos) - planetRadiusKm;
+	
+		water_vattribs[E.vm].position = dvec4(ghostPos, ghostElevation);
+		//water_vattribs[E.vm].position.w = ghostElevation;
+	}
+}

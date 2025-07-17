@@ -1,0 +1,209 @@
+#version 450
+
+// --- structures de données ---
+struct WaterVertexAttrib
+{
+	/// xyz = 3D position, w = average water altitude (before wave displacement)
+	dvec4 position;
+	/// xyz = normal to water surface, w = marker (ghost vertex or not)
+	vec4 normal;
+	/// xyz = water flow direction normalized, w = unused
+	vec4 flow;
+	
+	/// some references (prim0 is used as a containing triangle index, for water animation ; prim1 is unused ; prim2 is a vertex reference used for lakes]
+	int prim0;
+	int prim1;
+	int prim2;
+	
+	int padding1;
+	ivec4 padding2;
+};
+struct Edge
+{
+	/// indexes of the two vertices
+	int v0, v1;
+	/// index of the middle split vertex or -1
+	int vm;
+	/// LSB to MSB: first byte = split status (0: not split, 1: ghost split, 2: split), second byte = (0: noop, 1:ghost edge, 2:ghost marked (ie needs ghost split)), third byte = subdivision level	
+	uint status;
+	/// indexes of the two subedges if split or -1
+	int child0, child1;	
+	/// indexes of the two adjacent faces
+	int f0, f1;
+	/// Type : 0 none, 1 sea, 2 continent, 3 river
+	uint type;
+	
+	int padding0, padding1, padding2;
+};
+struct Face
+{
+	/// indexes of the three edges.
+	int e0, e1, e2;
+	/// normal to the triangle
+	float normal_x, normal_y, normal_z;
+	/// LSB to MSB : byte 0 = boolean (split 1 or not 0), byte 2 = lod
+	uint status;
+	//
+	uint type;
+};
+
+// --- shader storage buffers ---
+layout(binding = 0, std430) coherent buffer water_vattribs_buffer 
+{
+  WaterVertexAttrib water_vattribs[];
+};
+layout(binding = 1, std430) readonly buffer edges_buffer 
+{
+  Edge edges[];
+};
+layout(binding = 2, std430) readonly buffer faces_buffer 
+{
+  Face faces[];
+};
+
+// --- uniforms ---
+uniform uint lastVertexIndex;
+uniform double renderScale;
+uniform double planetRadiusKm;
+uniform double seaLevelKm;
+uniform double timeSeconds64;
+uniform dvec3 cameraPositionKm;
+uniform uint optionRiverPrimitives;
+
+uniform sampler3D noiseTexture;
+
+
+dvec3 getMirroredRepeatTexcoords64(dvec3 coords)
+{
+	dvec3 ipart;//integer part
+	dvec3 fpart = modf(coords, ipart);//fractional part
+	ipart = abs(fract(ipart * 0.5LF) - 0.5LF);
+	if (ipart.x < 0.0001LF)//odd integer:
+		fpart.x = 1.0LF - fpart.x;
+	if (ipart.y < 0.0001LF)//odd integer:
+		fpart.y = 1.0LF - fpart.y;
+	if (ipart.z < 0.0001LF)//odd integer:
+		fpart.z = 1.0LF - fpart.z;
+	
+	return fpart;
+}
+
+// --- MAIN ---
+layout(local_size_x = 128) in;
+void main( )
+{
+	uint i = gl_GlobalInvocationID.x;
+	if (i > lastVertexIndex)
+		return;
+
+	const WaterVertexAttrib wattrib = water_vattribs[i];
+	if (wattrib.position == dvec4(0.0LF))
+		return;
+	
+	//const bool ghostVertex = (wattrib.normal.w < 0.0);//use marker
+	//if (ghostVertex) // this is worse when enabled..
+		//return;
+	
+	// Displace & animate water surface:
+	double alt = length(wattrib.position.xyz) - planetRadiusKm;
+	//const double lerpOcean2River = clamp(smoothstep(0.0LF, 0.01LF, alt - seaLevelKm), 0.0LF, 1.0LF);//clamp serves to hide nan artifacts somehow for high altitude views
+	const double lerpOcean2River = smoothstep(0.0LF, 0.01LF, alt - seaLevelKm);
+	//if (isnan(lerpOcean2River))
+		//lerpOcean2River = 0.0LF;
+
+	// river
+	double riverDisplacement;
+	bool detailedView = distance(wattrib.position.xyz, cameraPositionKm) < 0.8LF;//true if camera is closer than 800 m to the water surface
+	
+	if (detailedView && optionRiverPrimitives == 1u && wattrib.prim0 >= 0)
+	{
+		dvec3 p = wattrib.position.xyz;
+		
+		Face PrimTriangle = faces[wattrib.prim0];
+		Edge e0 = edges[PrimTriangle.e0];
+		Edge e1 = edges[PrimTriangle.e1];
+		Edge e2 = edges[PrimTriangle.e2];
+						
+		//determine winding of edges (as they can appear in any order)
+		bool flip0 = false;
+		bool flip1 = false;
+		bool flip2 = false;
+		if (e0.v0 == e1.v0 || e0.v0 == e1.v1)
+			flip0 = true;
+		if (e1.v0 == e2.v0 || e1.v0 == e2.v1)
+			flip1 = true;
+		if (e2.v0 == e0.v0 || e2.v0 == e0.v1)
+			flip2 = true;
+		int prim0 = (flip0 ? e0.v1 : e0.v0);
+		int prim1 = (flip1 ? e1.v1 : e1.v0);
+		int prim2 = (flip2 ? e2.v1 : e2.v0);	
+		
+		//
+		WaterVertexAttrib prim = water_vattribs[prim0];
+		dvec3 v = p - prim.position.xyz;
+		dvec3 flow = dvec3(prim.flow.xyz);
+		dvec3 coords = 8.0LF * (v - 0.004LF * timeSeconds64 * flow);
+		vec3 texcoords = vec3(getMirroredRepeatTexcoords64(coords));
+		double h0 = double(-1.0 + 2.0*texture(noiseTexture, texcoords).g) * 0.0004LF;
+		coords = 8.0LF * (v - 0.008LF * timeSeconds64 * flow);
+		texcoords = vec3(getMirroredRepeatTexcoords64(coords));
+		h0 += double(abs(-1.0 + 2.0*texture(noiseTexture, texcoords).g)) * 0.00025LF;
+		dvec3 pos0 = prim.position.xyz;
+			
+		prim = water_vattribs[prim1];
+		v = p - prim.position.xyz;
+		flow = dvec3(prim.flow.xyz);
+		coords = 8.0LF * (v - 0.004LF * timeSeconds64 * flow);				
+		texcoords = vec3(getMirroredRepeatTexcoords64(coords));
+		double h1 = double(-1.0 + 2.0*texture(noiseTexture, texcoords).g) * 0.0004LF;
+		coords = 8.0LF * (v - 0.008LF * timeSeconds64 * flow);
+		texcoords = vec3(getMirroredRepeatTexcoords64(coords));
+		h1 += double(abs(-1.0 + 2.0*texture(noiseTexture, texcoords).g)) * 0.00025LF;
+		dvec3 pos1 = prim.position.xyz;
+		
+		prim = water_vattribs[prim2];
+		v = p - prim.position.xyz;
+		flow = dvec3(prim.flow.xyz);
+		coords = 8.0LF * (v - 0.004LF * timeSeconds64 * flow);				
+		texcoords = vec3(getMirroredRepeatTexcoords64(coords));
+		double h2 = double(-1.0 + 2.0*texture(noiseTexture, texcoords).g) * 0.0004LF;
+		coords = 8.0LF * (v - 0.008LF * timeSeconds64 * flow);
+		texcoords = vec3(getMirroredRepeatTexcoords64(coords));
+		h2 += double(abs(-1.0 + 2.0*texture(noiseTexture, texcoords).g)) * 0.00025LF;
+		dvec3 pos2 = prim.position.xyz;
+		
+		double iPrimTriangleArea = 2.0LF / length(cross(pos1 - pos0, pos2 - pos0));//inverted area of the triangle composed of the 3 primitives				
+		double w0 = iPrimTriangleArea * 0.5LF * length(cross(pos1 - p, pos2 - p));//barycentric coordinate
+		double w1 = iPrimTriangleArea * 0.5LF * length(cross(p - pos0, pos2 - pos0));//barycentric coordinate
+		double w2 = iPrimTriangleArea * 0.5LF * length(cross(pos1 - pos0, p - pos0));//barycentric coordinate			
+		//double w0 = 1.0LF - smoothstep(0.0LF, 0.048LF, distance(p, pos0));
+		//double w1 = 1.0LF - smoothstep(0.0LF, 0.048LF, distance(p, pos1));
+		//double w2 = 1.0LF - smoothstep(0.0LF, 0.048LF, distance(p, pos2));
+		
+		riverDisplacement = (w0 * h0 + w1 * h1 + w2 * h2) / (w0 + w1 + w2);
+	}
+	else {
+		//dvec3 riverflow = dvec3(wattrib.flow.xyz);	
+		//dvec3 riverflow = dvec3(normalize(wattrib.flow.xyz));
+		//dvec3 coords = wattrib.position.xyz - riverflow * (0.004LF * timeSeconds64);
+		dvec3 coords = wattrib.position.xyz - 0.004LF * timeSeconds64;
+		coords *= 8.0LF;
+		
+		vec3 texcoords = vec3(getMirroredRepeatTexcoords64(coords));
+		const float riverNoise0 = texture(noiseTexture, texcoords).g;// + 0.1 * texture(noiseTexture, vec3(getMirroredRepeatTexcoords64(64.0LF * (wattrib.position.xyz - 0.001LF * timeSeconds64)))).r;	
+		riverDisplacement = double(-1.0 + 2.0*riverNoise0) * 0.0004LF;// * double(0.4 + 0.6*wattrib.flow.w);
+	}
+	
+	// sea:
+	dvec3 coords = wattrib.position.xyz + timeSeconds64 * 0.004LF;
+	coords *= 3.0LF;	
+	vec3 texcoords = vec3(getMirroredRepeatTexcoords64(coords));
+	const float seaNoise0 = texture(noiseTexture, texcoords).g;
+	const double seaDisplacement = double(-1.0 + 2.0*seaNoise0) * 0.002LF;
+	
+	// mix:
+	alt += mix(seaDisplacement, riverDisplacement, lerpOcean2River);
+	
+	// write back to buffer:	
+	water_vattribs[i].position = dvec4(wattrib.position.xyz, alt);
+}
