@@ -4,7 +4,7 @@ This repository contains the implementation of the paper:
 
 **Real-Time Hyper-Amplification of Planets**  
 Yann Cortial, Eric Guérin, Adrien Peytavie, Eric Galin  
-Published in *The Visual Computer*  
+Published in *The Visual Computer* 2019
 [Read the paper](https://hal.science/hal-02967067v1/document)
 
 ---
